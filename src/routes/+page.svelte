@@ -11,7 +11,7 @@
 	}
 
 	const rand = seededRand(89);
-	const zones = 8;
+	const zones = 8; 
 	const topStart = 20, topEnd = 93;
 	const zoneH = (topEnd - topStart) / zones;
 	const postits = Array.from({ length: 16 }, (_, i) => ({
