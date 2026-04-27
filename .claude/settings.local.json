@@ -7,7 +7,14 @@
       "Bash(curl -s http://localhost:5174/)",
       "mcp__claude_ai_Context7__resolve-library-id",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5174/)",
-      "Bash(npx svelte-check *)"
+      "Bash(npx svelte-check *)",
+      "Bash(curl -s http://localhost:5173/ -o /tmp/page.html)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"vite dev\")",
+      "Bash(pkill -f \"vite\\\\b\")",
+      "Bash(kill -9 24810)",
+      "Bash(curl -s http://localhost:5173/)",
+      "Bash(curl -s \"http://localhost:5173/src/lib/PostitsGL/scene.ts\")"
     ]
   }
 }

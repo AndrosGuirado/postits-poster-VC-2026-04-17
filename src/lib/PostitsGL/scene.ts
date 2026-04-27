@@ -1,7 +1,5 @@
-import * as THREE from 'three/webgpu';
-import { CameraHelper, DirectionalLightHelper } from 'three';
+import * as THREE from 'three';
 import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js';
-import { positionLocal, uniform, smoothstep, float, vec3, uv } from 'three/tsl';
 import gsap from 'gsap';
 import { Pane } from 'tweakpane';
 import postitSvg from '../Postit/postit.svg?raw';
@@ -17,33 +15,33 @@ const SVG_H = 60;
 const PAPER_W = 1;
 const PAPER_H = 297 / 210;
 const POSTIT_W = 0.38;
+const POSTIT_HALF_W = POSTIT_W / 2;
 const POSTIT_SCALE = POSTIT_W / SVG_W;
+// Per-layer z step. Kept tiny so stacked stuck postits cast almost no shadow
+// onto each other (they read as glued to the wall together). Real shadow
+// only appears when one is hovered/dragged, because the curl displacement
+// (LIFT_MAX = 0.03) lifts it well above the others.
+const Z_STEP = 0.001;
 
 const POSTIT_HALF_H = (SVG_H / 2) * POSTIT_SCALE;
 const STICKY_FRACTION = 0.2;
-const STICKY_END_Y = -POSTIT_HALF_H + STICKY_FRACTION * SVG_H * POSTIT_SCALE;
-const LIFT_MAX = 0.015; // peak z-lift at the bottom edge
+// Geometry is flipped on Y at construction (see buildSharedGeometries) so the
+// sticky band ends up at +y under the Y-up camera. STICKY_END_Y is the lower
+// boundary of the sticky band in (flipped) geometry coords — anything below
+// this curls; anything above stays flat.
+const STICKY_END_Y = POSTIT_HALF_H - STICKY_FRACTION * SVG_H * POSTIT_SCALE;
+const LIFT_MAX = 0.03; // peak z-lift at the bottom edge
 const PLANE_Y_SEGS = 32;
 // Curl is invisible under an orthographic projection unless the paper also
 // shortens visibly. Pulling lifted vertices back toward the sticky band fakes
 // the foreshortening of the paper rolling toward the viewer.
 const CURL_Y_RATIO = 0.4;
 
-const SHADOW_EXPAND = 1.05; // shadow plane is this much larger than the postit
-const SHADOW_FADE_FRAC = (1 - 1 / SHADOW_EXPAND) / 2;
-
-const STATIC_SHADOW_OFFSET = 0.0015; // always-on local xy offset (subtle separation)
-const STATIC_SHADOW_OPACITY = 0.06; // base opacity for every postit
-const LIFT_SHADOW_OFFSET_RATIO = 0.22; // extra downward offset proportional to lift
-const LIFT_SHADOW_SPREAD_X = 0.22; // bottom of shadow fans out laterally on lift
-const LIFT_SHADOW_OPACITY_PER_LIFT = 0.06 / LIFT_MAX; // extra opacity proportional to lift
-
 const YELLOW = 0xf2f745;
 const WHITE = 0xf5f5f0;
 
 type SharedGeometries = {
 	yellowBg: THREE.BufferGeometry;
-	shadowBg: THREE.BufferGeometry;
 	blackPaths: THREE.BufferGeometry[];
 };
 
@@ -56,11 +54,21 @@ function buildSharedGeometries(): SharedGeometries {
 		if (i === 0) return; // background replaced by tessellated plane
 		const shapes = SVGLoader.createShapes(path);
 		shapes.forEach((shape) => {
-			const g = new THREE.ShapeGeometry(shape, 24);
+			// Higher segment count → smoother curve triangulation, fewer
+			// visible facet stripes on rounded letterforms.
+			const g = new THREE.ShapeGeometry(shape, 64);
 			g.translate(-SVG_W / 2, -SVG_H / 2, 0);
 			g.scale(POSTIT_SCALE, POSTIT_SCALE, 1);
-			// nudge text in z so it draws on top of the bent yellow plane
-			g.translate(0, 0, 0.0002);
+			// SVG y grows downward; the camera is Y-up. Flip so the SVG's
+			// top (sticky band) ends up at +y and lands at the top of the
+			// screen. This inverts face winding — the lit material below
+			// compensates for that in onBeforeCompile.
+			g.scale(1, -1, 1);
+			// Tiny static offset just to break the flat-on-flat z-fight when
+			// the postit is stuck (no curl). The dynamic offset that scales
+			// with uLift is added in the black material's vertex shader so
+			// chord-deviation stripes stay away during curl.
+			g.translate(0, 0, 0.0001);
 			blackPaths.push(g);
 		});
 	});
@@ -71,107 +79,134 @@ function buildSharedGeometries(): SharedGeometries {
 		1,
 		PLANE_Y_SEGS,
 	);
-	const shadowBg = new THREE.PlaneGeometry(
-		SVG_W * POSTIT_SCALE * SHADOW_EXPAND,
-		SVG_H * POSTIT_SCALE * SHADOW_EXPAND,
-		1,
-		PLANE_Y_SEGS,
-	);
+	yellowBg.scale(1, -1, 1);
 
-	return { yellowBg, shadowBg, blackPaths };
+	return { yellowBg, blackPaths };
 }
 
-type LiftUniform = ReturnType<typeof uniform>;
+type LiftUniform = { value: number };
 
 type PostitMaterials = {
-	yellow: THREE.MeshBasicNodeMaterial;
-	black: THREE.MeshBasicNodeMaterial;
-	shadow: THREE.MeshBasicNodeMaterial;
+	yellow: THREE.MeshLambertMaterial;
+	yellowDepth: THREE.MeshDepthMaterial;
+	black: THREE.MeshBasicMaterial;
 	lift: LiftUniform;
+	hoverX: LiftUniform; // -1 (cursor at left edge) … +1 (cursor at right edge)
 };
 
+// GLSL injection that bends the postit's bottom up in z and shortens its y
+// extent (visible curl under the orthographic camera). Shared by the visible
+// material and the shadow-pass depth material so the cast shadow follows the
+// curl, not the flat geometry.
+//
+// Geometry is flipped on Y, so:
+//   sticky band is at +y (top)         ≈ +POSTIT_HALF_H
+//   sticky/curl boundary               = +STICKY_END_Y
+//   free curling bottom                = -POSTIT_HALF_H
+function buildCurlInjection(
+	lift: LiftUniform,
+	hoverX: LiftUniform,
+	textBoost = false,
+) {
+	const stickyEnd = STICKY_END_Y.toFixed(6);
+	const negHalfH = (-POSTIT_HALF_H).toFixed(6);
+	const curlY = CURL_Y_RATIO.toFixed(6);
+	const halfW = POSTIT_HALF_W.toFixed(6);
+	// Black text gets an extra z lift that scales with the curl. Without it,
+	// linear interpolation across text triangles drops below the yellow
+	// plane's denser-tessellation curve in the curl's concave region and
+	// produces visible stripes through the letters.
+	const textBoostLine = textBoost ? 'transformed.z += uLift * 0.12;' : '';
+
+	return (shader: {
+		uniforms: Record<string, unknown>;
+		vertexShader: string;
+	}) => {
+		shader.uniforms.uLift = lift;
+		shader.uniforms.uHoverX = hoverX;
+		shader.vertexShader = shader.vertexShader
+			.replace(
+				'#include <common>',
+				`#include <common>
+				uniform float uLift;
+				uniform float uHoverX;`,
+			)
+			.replace(
+				'#include <begin_vertex>',
+				`#include <begin_vertex>
+				float curlT = smoothstep(${stickyEnd}, ${negHalfH}, position.y);
+				float curlT2 = curlT * curlT;
+				float xNorm = position.x / ${halfW};
+				float asymmetry = max(0.0, 1.0 + uHoverX * xNorm * 1.5);
+				float curlAmount = curlT2 * uLift * asymmetry;
+				transformed.y += curlAmount * ${curlY};
+				transformed.z += curlAmount;
+				${textBoostLine}`,
+			);
+	};
+}
+
 function makePostitMaterials(): PostitMaterials {
-	const lift = uniform(0);
+	const lift: LiftUniform = { value: 0 };
+	const hoverX: LiftUniform = { value: 0 };
+	const injectCurl = buildCurlInjection(lift, hoverX, false);
+	const injectCurlText = buildCurlInjection(lift, hoverX, true);
 
-	// 0 inside the sticky band, ramps to 1 at the bottom edge.
-	const t = smoothstep(
-		float(STICKY_END_Y),
-		float(POSTIT_HALF_H),
-		positionLocal.y,
-	);
-	const t2 = t.mul(t);
-	const liftZ = t2.mul(lift);
-	// Pull bent vertices back toward the sticky band so the curl reads
-	// visibly even though the camera is orthographic.
-	const liftY = t2.mul(lift).mul(float(-CURL_Y_RATIO));
-
-	const liftedPos = vec3(
-		positionLocal.x,
-		positionLocal.y.add(liftY),
-		positionLocal.z.add(liftZ),
-	);
-
-	const yellow = new THREE.MeshBasicNodeMaterial({
+	const yellow = new THREE.MeshLambertMaterial({
 		color: YELLOW,
 		side: THREE.DoubleSide,
 	});
-	yellow.positionNode = liftedPos;
+	// Two injections in one onBeforeCompile:
+	//  1. vertex curl (smoothstep + uLift)
+	//  2. fragment normal_fragment_begin override — geometry was flipped to
+	//     fix orientation under the Y-up camera, which inverts winding.
+	//     Lambert's DOUBLE_SIDED branch would then multiply the normal by
+	//     faceDirection=-1 and zero the directional contribution.
+	yellow.onBeforeCompile = (shader) => {
+		injectCurl(shader);
+		shader.fragmentShader = shader.fragmentShader.replace(
+			'#include <normal_fragment_begin>',
+			`
+			float faceDirection = 1.0;
+			vec3 normal = normalize( vNormal );
+			vec3 nonPerturbedNormal = normal;
+			`,
+		);
+	};
+	// DoubleSide for shadow casting since the visual face reads as back-facing
+	// in NDC after the geometry flip.
+	yellow.shadowSide = THREE.DoubleSide;
 
-	const black = new THREE.MeshBasicNodeMaterial({
+	// Custom depth material for the shadow pass — same vertex curl so the cast
+	// shadow follows the curled paper rather than the flat plane.
+	const yellowDepth = new THREE.MeshDepthMaterial({
+		depthPacking: THREE.RGBADepthPacking,
+		side: THREE.DoubleSide,
+	});
+	yellowDepth.onBeforeCompile = (shader) => injectCurl(shader);
+
+	const black = new THREE.MeshBasicMaterial({
 		color: 0x000000,
 		side: THREE.DoubleSide,
 	});
-	black.positionNode = liftedPos;
+	black.onBeforeCompile = (shader) => injectCurlText(shader);
 
-	// Shadow stays anchored on the wall while the paper curls upward, so the
-	// gap between paper and shadow grows naturally with lift. On lift the
-	// shadow's lower vertices extend downward and spread laterally, suggesting
-	// a soft penumbra fanning out from the lifted edge.
-	const shadowLift = t2.mul(lift);
-	const lateralSpread = positionLocal.x
-		.mul(shadowLift)
-		.mul(float(LIFT_SHADOW_SPREAD_X));
-	const downwardOffset = shadowLift.mul(float(LIFT_SHADOW_OFFSET_RATIO));
-	const baseOffset = float(STATIC_SHADOW_OFFSET);
-	const shadowPos = vec3(
-		positionLocal.x.add(lateralSpread).add(baseOffset),
-		positionLocal.y.add(downwardOffset).add(baseOffset),
-		float(-0.0005),
-	);
-
-	const shadow = new THREE.MeshBasicNodeMaterial({
-		color: 0x000000,
-		transparent: true,
-		side: THREE.DoubleSide,
-		depthWrite: false,
-	});
-	shadow.positionNode = shadowPos;
-
-	// Soft rectangular edge falloff to fake a blurred drop shadow.
-	const shadowUV = uv();
-	const fadeIn = float(SHADOW_FADE_FRAC);
-	const fadeOut = float(1 - SHADOW_FADE_FRAC);
-	const edgeMask = smoothstep(float(0), fadeIn, shadowUV.x)
-		.mul(smoothstep(float(1), fadeOut, shadowUV.x))
-		.mul(smoothstep(float(0), fadeIn, shadowUV.y))
-		.mul(smoothstep(float(1), fadeOut, shadowUV.y));
-	const liftAlpha = t2.mul(lift).mul(LIFT_SHADOW_OPACITY_PER_LIFT);
-	const totalAlpha = liftAlpha.add(float(STATIC_SHADOW_OPACITY));
-	shadow.opacityNode = totalAlpha.mul(edgeMask);
-
-	return { yellow, black, shadow, lift };
+	return { yellow, yellowDepth, black, lift, hoverX };
 }
 
 export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const scene = new THREE.Scene();
 	scene.background = new THREE.Color(WHITE);
 
-	// Y-down ortho cam: top of paper is y=0, bottom is y=PAPER_H.
+	// Standard Y-up ortho cam (top=PAPER_H, bottom=0). The previous Y-down
+	// setup (top=0, bottom=PAPER_H) was breaking three.js's directional-light
+	// view-space transform, which is why no shadow appeared and Sun > intensity
+	// had no effect. Postit positions and pointer mapping are flipped below.
 	const camera = new THREE.OrthographicCamera(
 		0,
 		PAPER_W,
-		0,
 		PAPER_H,
+		0,
 		-100,
 		100,
 	);
@@ -181,22 +216,29 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	const groups: THREE.Group[] = [];
 	const mats: PostitMaterials[] = [];
+	const yellowMeshes: THREE.Mesh[] = [];
 
 	postits.forEach((p, idx) => {
 		const m = makePostitMaterials();
 		const g = new THREE.Group();
+
 		const yellowMesh = new THREE.Mesh(sharedGeos.yellowBg, m.yellow);
 		yellowMesh.castShadow = true;
+		yellowMesh.receiveShadow = true;
+		yellowMesh.customDepthMaterial = m.yellowDepth;
 		g.add(yellowMesh);
+		yellowMeshes.push(yellowMesh);
+
 		sharedGeos.blackPaths.forEach((geom) =>
 			g.add(new THREE.Mesh(geom, m.black)),
 		);
-		// Each postit gets its own depth layer so the upper one's shadow can pass
-		// the depth test against postits beneath it.
+
+		// Each postit gets its own depth layer. Y is flipped because PostitData
+		// uses CSS-style "top % from top of paper" but the camera is Y-up.
 		g.position.set(
 			(p.left / 100) * PAPER_W,
-			(p.top / 100) * PAPER_H,
-			idx * 0.001,
+			(1 - p.top / 100) * PAPER_H,
+			idx * Z_STEP,
 		);
 		g.rotation.z = (p.rotate * Math.PI) / 180;
 		scene.add(g);
@@ -205,21 +247,29 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	});
 
 	// ---------- Native shadow setup ----------
-	// A wall plane behind the postits receives shadows; the postits cast them.
-	// One directional light at a grazing angle drives the shadow direction.
-	// The wall sits well behind z=0 so the shadow has room to offset visibly
-	// under a near-flat caster (postit z lift is small).
-	const WALL_Z = -0.05;
+	// Wall plane behind the postits receives shadows; postits cast onto it.
+	// ShadowMaterial renders only the shadow term as a transparent darkening,
+	// so the scene background stays visible elsewhere.
 	const wall = new THREE.Mesh(
-		new THREE.PlaneGeometry(PAPER_W * 1.6, PAPER_H * 1.6),
-		new THREE.ShadowNodeMaterial({ transparent: true, opacity: 0.25 }),
+		new THREE.PlaneGeometry(PAPER_W * 3, PAPER_H * 3),
+		new THREE.ShadowMaterial({ opacity: 0.18 }),
 	);
-	wall.position.set(PAPER_W / 2, PAPER_H / 2, WALL_Z);
+	// Wall close behind the postits — the smaller the gap, the tighter the
+	// shadow tucks under the postit edge.
+	wall.position.set(PAPER_W / 2, PAPER_H / 2, -0.005);
 	wall.receiveShadow = true;
 	scene.add(wall);
 
-	const sun = new THREE.DirectionalLight(0xffffff, 1);
-	sun.position.set(0.1, 0.15, 0.55);
+	// High ambient + low directional: the postit reads as full YELLOW under
+	// lit areas (ambient + dir·ndotl saturates to 1) while shadowed areas
+	// only lose the directional contribution — a subtle but visible
+	// darkening on postit-on-postit overlap.
+	const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+	scene.add(ambient);
+
+	const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+	// Upper-left: small x, large y (since camera is Y-up now).
+	sun.position.set(0.33, PAPER_H - 0.15, 2.0);
 	sun.target.position.set(PAPER_W / 2, PAPER_H / 2, 0);
 	sun.castShadow = true;
 	sun.shadow.mapSize.set(2048, 2048);
@@ -228,33 +278,37 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	sun.shadow.camera.top = 1.2;
 	sun.shadow.camera.bottom = -1.2;
 	sun.shadow.camera.near = 0.1;
-	sun.shadow.camera.far = 2;
-	sun.shadow.bias = -0.0001;
-	sun.shadow.radius = 6;
+	sun.shadow.camera.far = 4;
+	// normalBias must stay below the postit-to-postit z-step (Z_STEP) or the
+	// receiver's check overshoots the caster's depth and postit-on-postit
+	// shadow disappears. Also clears self-shadow stripes from the curl.
+	sun.shadow.bias = 0;
+	sun.shadow.normalBias = 0.0005;
+	// Larger radius = softer PCF blur, less crispy shadow edge.
+	sun.shadow.radius = 2;
 	scene.add(sun);
 	scene.add(sun.target);
 
 	const debug =
 		typeof window !== 'undefined' &&
 		new URLSearchParams(window.location.search).get('debug') === '1';
-	let lightHelper: DirectionalLightHelper | null = null;
-	let camHelper: CameraHelper | null = null;
+	let lightHelper: THREE.DirectionalLightHelper | null = null;
+	let camHelper: THREE.CameraHelper | null = null;
 	if (debug) {
-		lightHelper = new DirectionalLightHelper(sun, 0.15);
-		camHelper = new CameraHelper(sun.shadow.camera);
+		lightHelper = new THREE.DirectionalLightHelper(sun, 0.15);
+		camHelper = new THREE.CameraHelper(sun.shadow.camera);
 		scene.add(lightHelper);
 		scene.add(camHelper);
 	}
 
-	const renderer = new THREE.WebGPURenderer({
+	const renderer = new THREE.WebGLRenderer({
 		canvas,
 		antialias: true,
 		alpha: false,
-		forceWebGL: typeof navigator !== 'undefined' && !(navigator as any).gpu,
 	});
 	renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 	renderer.shadowMap.enabled = true;
-	renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+	renderer.shadowMap.type = THREE.PCFShadowMap;
 
 	let needsRender = true;
 	let raf = 0;
@@ -277,13 +331,8 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		}
 	}
 
-	let started = false;
-	(async () => {
-		await renderer.init();
-		resize();
-		started = true;
-		tick();
-	})();
+	resize();
+	tick();
 
 	const ro = new ResizeObserver(resize);
 	ro.observe(canvas);
@@ -292,54 +341,65 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	// ---------- Debug controls (tweakpane) ----------
 	let pane: Pane | null = null;
-	if (debug) {
-		pane = new Pane({ title: 'Light' });
+	//if (debug) {
+	pane = new Pane({ title: 'Light' });
 
-		const onLightChange = () => {
-			sun.target.updateMatrixWorld();
-			sun.shadow.camera.updateProjectionMatrix();
-			lightHelper?.update();
-			camHelper?.update();
-			requestRender();
-		};
+	const onLightChange = () => {
+		sun.target.updateMatrixWorld();
+		sun.shadow.camera.updateProjectionMatrix();
+		lightHelper?.update();
+		camHelper?.update();
+		requestRender();
+	};
 
-		const sunFolder = pane.addFolder({ title: 'Sun' });
-		sunFolder
-			.addBinding(sun.position, 'x', { min: -1, max: 1.5, step: 0.01 })
-			.on('change', onLightChange);
-		sunFolder
-			.addBinding(sun.position, 'y', { min: -1, max: 1.5, step: 0.01 })
-			.on('change', onLightChange);
-		sunFolder
-			.addBinding(sun.position, 'z', { min: 0.05, max: 2, step: 0.01 })
-			.on('change', onLightChange);
-		sunFolder
-			.addBinding(sun, 'intensity', { min: 0, max: 3, step: 0.05 })
-			.on('change', requestRender);
+	const sunFolder = pane.addFolder({ title: 'Sun' });
+	sunFolder
+		.addBinding(sun.position, 'x', { min: -2, max: 2, step: 0.001 })
+		.on('change', onLightChange);
+	sunFolder
+		.addBinding(sun.position, 'y', { min: -2, max: 2, step: 0.001 })
+		.on('change', onLightChange);
+	sunFolder
+		.addBinding(sun.position, 'z', { min: 0.01, max: 2, step: 0.001 })
+		.on('change', onLightChange);
+	sunFolder
+		.addBinding(sun, 'intensity', { min: 0, max: 3, step: 0.05 })
+		.on('change', requestRender);
 
-		const shadowFolder = pane.addFolder({ title: 'Shadow' });
-		shadowFolder
-			.addBinding(sun.shadow, 'radius', { min: 0, max: 20, step: 0.5 })
-			.on('change', requestRender);
-		shadowFolder
-			.addBinding(sun.shadow, 'bias', {
-				min: -0.005,
-				max: 0.005,
-				step: 0.0001,
-			})
-			.on('change', requestRender);
-		const wallMat = wall.material as THREE.ShadowNodeMaterial;
-		shadowFolder
-			.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 })
-			.on('change', requestRender);
-		shadowFolder
-			.addBinding(wall.position, 'z', {
-				min: -0.3,
-				max: -0.005,
-				step: 0.005,
-			})
-			.on('change', requestRender);
-	}
+	const shadowFolder = pane.addFolder({ title: 'Shadow' });
+	shadowFolder.addBinding(sun, 'castShadow').on('change', requestRender);
+	shadowFolder
+		.addBinding(sun.shadow, 'radius', { min: 0, max: 20, step: 0.5 })
+		.on('change', requestRender);
+	shadowFolder
+		.addBinding(sun.shadow, 'bias', {
+			min: -0.01,
+			max: 0.01,
+			step: 0.0001,
+		})
+		.on('change', requestRender);
+	shadowFolder
+		.addBinding(sun.shadow, 'normalBias', {
+			min: 0,
+			max: 0.1,
+			step: 0.001,
+		})
+		.on('change', requestRender);
+	const wallMat = wall.material as THREE.ShadowMaterial;
+	shadowFolder
+		.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 })
+		.on('change', requestRender);
+	shadowFolder
+		.addBinding(ambient, 'intensity', { min: 0, max: 1.5, step: 0.05 })
+		.on('change', requestRender);
+	shadowFolder
+		.addBinding(wall.position, 'z', {
+			min: -0.3,
+			max: -0.001,
+			step: 0.001,
+		})
+		.on('change', requestRender);
+	//}
 
 	// ---------- Coverage + hover state ----------
 
@@ -347,6 +407,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const covered: boolean[] = groups.map(() => false);
 	let hoveredIndex = -1;
 	let draggingIndex = -1;
+	// Postit just released from a drag — flat ("stuck") until the cursor
+	// leaves and re-enters, regardless of hover state.
+	let stuckIndex = -1;
 
 	function isAbove(j: number, i: number): boolean {
 		const a = groups[j].position.z;
@@ -383,7 +446,11 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	function targetLiftFor(i: number): number {
 		if (covered[i]) return 0;
-		if (i === draggingIndex || i === hoveredIndex) return LIFT_MAX;
+		// Dragging takes priority over the stuck flag — re-grabbing a
+		// just-dropped postit immediately peels it again.
+		if (i === draggingIndex) return LIFT_MAX;
+		if (i === stuckIndex) return 0;
+		if (i === hoveredIndex) return LIFT_MAX;
 		return 0;
 	}
 
@@ -391,6 +458,12 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		for (let i = 0; i < groups.length; i++) {
 			const target = targetLiftFor(i);
 			const u = mats[i].lift;
+			const mesh = yellowMeshes[i];
+			// Disable self-shadow as soon as the postit starts lifting — the
+			// curl creates depth variation across each shadow-map texel and
+			// PCF would average it into visible stripe banding on the
+			// curling surface. Re-enable once it has fully settled flat.
+			if (target > 0) mesh.receiveShadow = false;
 			if (u.value === target) continue;
 			gsap.killTweensOf(u);
 			gsap.to(u, {
@@ -398,6 +471,12 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				duration: 0.45,
 				ease: 'power2.out',
 				onUpdate: requestRender,
+				onComplete: () => {
+					if (target === 0) {
+						mesh.receiveShadow = true;
+						requestRender();
+					}
+				},
 			});
 		}
 	}
@@ -425,13 +504,39 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	function getWorld(clientX: number, clientY: number, out: THREE.Vector2) {
 		const rect = canvas.getBoundingClientRect();
 		out.x = ((clientX - rect.left) / rect.width) * PAPER_W;
-		out.y = ((clientY - rect.top) / rect.height) * PAPER_H;
+		// Flip y: screen-down = world-down (smaller world y) under Y-up camera.
+		out.y = PAPER_H - ((clientY - rect.top) / rect.height) * PAPER_H;
 	}
 
 	function setNdc(clientX: number, clientY: number) {
 		const rect = canvas.getBoundingClientRect();
 		ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
 		ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+	}
+
+	function setHoverX(idx: number, worldX: number, worldY: number) {
+		const g = groups[idx];
+		const dx = worldX - g.position.x;
+		const dy = worldY - g.position.y;
+		// Inverse-rotate to local space (group only rotates around z).
+		const c = Math.cos(g.rotation.z);
+		const s = Math.sin(g.rotation.z);
+		const lx = c * dx + s * dy;
+		const u = mats[idx].hoverX;
+		gsap.killTweensOf(u);
+		u.value = Math.max(-1, Math.min(1, lx / POSTIT_HALF_W));
+	}
+
+	function releaseHoverX(idx: number) {
+		if (idx < 0) return;
+		const u = mats[idx].hoverX;
+		gsap.killTweensOf(u);
+		gsap.to(u, {
+			value: 0,
+			duration: 0.45,
+			ease: 'power2.out',
+			onUpdate: requestRender,
+		});
 	}
 
 	function pickTopGroupIndex(): number {
@@ -465,12 +570,24 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 		getWorld(e.clientX, e.clientY, startWorld);
 		startPos.set(dragging.position.x, dragging.position.y);
+		setHoverX(idx, startWorld.x, startWorld.y);
 		originalR = dragging.rotation.z;
 		liftR = originalR + ((Math.random() - 0.5) * 10 * Math.PI) / 180;
 		dropR = originalR + ((Math.random() - 0.5) * 14 * Math.PI) / 180;
 
 		topZ += 1;
-		dragging.position.z = topZ * 0.001;
+		// Two-phase unstick: while the curl ramps up (~0.4s, see applyTargets)
+		// the top stays glued — z holds at its original value. Then the
+		// sticky band releases and z snaps up to the top of the stack with
+		// a fast settle. Simulates "the top of a postit is glued and more
+		// resistant than the rest".
+		gsap.to(dragging.position, {
+			z: topZ * Z_STEP,
+			duration: 0.18,
+			delay: 0.4,
+			ease: 'expo.out',
+			onUpdate: requestRender,
+		});
 
 		updateCoverageAndLifts();
 
@@ -521,6 +638,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				0,
 				Math.min(PAPER_H, startPos.y + dy),
 			);
+			// Cursor offset relative to the dragged postit stays fixed during
+			// drag, so the curl bias keeps pointing at the grabbed side.
+			setHoverX(draggingIndex, wp.x, wp.y);
 			updateCoverageAndLifts();
 			requestRender();
 			return;
@@ -530,14 +650,29 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		raycaster.setFromCamera(ndc, camera);
 		const idx = pickTopGroupIndex();
 		if (idx !== hoveredIndex) {
+			if (hoveredIndex !== -1) releaseHoverX(hoveredIndex);
+			// Cursor moved off the just-dropped postit → un-stick it so a
+			// future re-hover can peel it again.
+			if (stuckIndex !== -1 && hoveredIndex === stuckIndex) {
+				stuckIndex = -1;
+			}
 			hoveredIndex = idx;
 			applyTargets();
+		}
+		if (idx !== -1) {
+			getWorld(e.clientX, e.clientY, wp);
+			setHoverX(idx, wp.x, wp.y);
+			requestRender();
 		}
 	}
 
 	function onPointerUp() {
 		if (!dragging) return;
 		const d = dragging;
+		releaseHoverX(draggingIndex);
+		// Mark this postit as freshly stuck — its lift animates back to 0
+		// and stays flat even though the cursor is still over it.
+		stuckIndex = draggingIndex;
 		dragging = null;
 		draggingIndex = -1;
 		gsap.killTweensOf(d.scale);
@@ -555,6 +690,8 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	function onPointerLeave() {
 		if (hoveredIndex !== -1) {
+			releaseHoverX(hoveredIndex);
+			if (hoveredIndex === stuckIndex) stuckIndex = -1;
 			hoveredIndex = -1;
 			applyTargets();
 		}
@@ -575,12 +712,11 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			window.removeEventListener('pointermove', onPointerMove);
 			window.removeEventListener('pointerup', onPointerUp);
 			sharedGeos.yellowBg.dispose();
-			sharedGeos.shadowBg.dispose();
 			sharedGeos.blackPaths.forEach((g) => g.dispose());
 			mats.forEach((m) => {
 				m.yellow.dispose();
+				m.yellowDepth.dispose();
 				m.black.dispose();
-				m.shadow.dispose();
 			});
 			wall.geometry.dispose();
 			(wall.material as THREE.Material).dispose();
@@ -594,7 +730,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				camHelper.dispose();
 			}
 			pane?.dispose();
-			if (started) renderer.dispose();
+			renderer.dispose();
 		},
 	};
 }
