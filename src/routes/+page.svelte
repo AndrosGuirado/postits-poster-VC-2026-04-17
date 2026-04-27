@@ -1,6 +1,5 @@
 <script lang="ts">
-	import Postit from '$lib/Postit/index.svelte';
-	import { draggable } from '$lib/actions/draggable';
+	import PostitsGL from '$lib/PostitsGL/index.svelte';
 
 	function seededRand(seed: number) {
 		let s = seed;
@@ -11,7 +10,7 @@
 	}
 
 	const rand = seededRand(89);
-	const zones = 8; 
+	const zones = 8;
 	const topStart = 20, topEnd = 93;
 	const zoneH = (topEnd - topStart) / zones;
 	const postits = Array.from({ length: 16 }, (_, i) => ({
@@ -24,9 +23,7 @@
 <template lang="pug">
 	main.canvas
 		.paper
-			+each('postits as p')
-				.anchor(use:draggable style="left:{p.left.toFixed(2)}%;top:{p.top.toFixed(2)}%;transform:translate(-50%,-50%) rotate({p.rotate.toFixed(2)}deg)")
-					Postit
+			PostitsGL(postits!="{postits}")
 </template>
 
 <style lang="stylus">
@@ -49,12 +46,4 @@
 		background-color var(--white)
 		box-shadow var(--shadow-paper)
 		overflow hidden
-
-	.anchor
-		position absolute
-		width 38%
-		cursor grab
-
-		&:active
-			cursor grabbing
 </style>
