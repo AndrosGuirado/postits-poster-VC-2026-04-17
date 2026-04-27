@@ -6,7 +6,8 @@
       "Bash(npm run *)",
       "Bash(curl -s http://localhost:5174/)",
       "mcp__claude_ai_Context7__resolve-library-id",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5174/)"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5174/)",
+      "Bash(npx svelte-check *)"
     ]
   }
 }

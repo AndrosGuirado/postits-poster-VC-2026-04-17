@@ -15,11 +15,13 @@
 		"@sveltejs/adapter-auto": "^7.0.1",
 		"@sveltejs/kit": "^2.57.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"@tweakpane/core": "^2.0.5",
 		"pug": "^3.0.4",
 		"stylus": "^0.64.0",
 		"svelte": "^5.55.2",
 		"svelte-check": "^4.4.6",
 		"svelte-preprocess": "^6.0.3",
+		"tweakpane": "^4.0.5",
 		"typescript": "^6.0.2",
 		"vite": "^8.0.7"
 	},
