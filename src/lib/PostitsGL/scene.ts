@@ -116,7 +116,7 @@ function buildCurlInjection(
 	// linear interpolation across text triangles drops below the yellow
 	// plane's denser-tessellation curve in the curl's concave region and
 	// produces visible stripes through the letters.
-	const textBoostLine = textBoost ? 'transformed.z += uLift * 0.12;' : '';
+	const textBoostLine = textBoost ? 'transformed.z += uLift * 0.3;' : '';
 
 	return (shader: {
 		uniforms: Record<string, unknown>;
@@ -401,6 +401,21 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		.on('change', requestRender);
 	//}
 
+	// ---------- Drag swing (velocity-driven tilt) ----------
+	// Each frame: decay the horizontal velocity, compute a bounded tilt
+	// (tanh-saturated so quick flicks don't over-rotate), and lerp the
+	// dragged postit's rotation.z toward originalR + tilt.
+	function updateDragSwing() {
+		if (!dragging) return;
+		velocityX *= 0.85;
+		// Saturate around ~10° max swing (0.18 rad).
+		const tilt = Math.tanh(velocityX * 0.4) * 0.18;
+		const target = originalR - tilt;
+		dragging.rotation.z += (target - dragging.rotation.z) * 0.2;
+		requestRender();
+	}
+	gsap.ticker.add(updateDragSwing);
+
 	// ---------- Coverage + hover state ----------
 
 	const aabbs: THREE.Box3[] = groups.map(() => new THREE.Box3());
@@ -410,6 +425,16 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	// Postit just released from a drag — flat ("stuck") until the cursor
 	// leaves and re-enters, regardless of hover state.
 	let stuckIndex = -1;
+	// Postit currently in the post-drop rotation phase. Lift is held at
+	// LIFT_MAX during rotation so the postit can't visually "stick" until
+	// it has finished orienting itself.
+	let transitioningIndex = -1;
+	let transitionTimeline: gsap.core.Timeline | null = null;
+	let dragStartTimeline: gsap.core.Timeline | null = null;
+	// quickTo handlers for smooth cursor-follow on the dragged postit's xy.
+	// Created at drag start, cleared on drag end.
+	let xTo: ((value: number) => void) | null = null;
+	let yTo: ((value: number) => void) | null = null;
 
 	function isAbove(j: number, i: number): boolean {
 		const a = groups[j].position.z;
@@ -449,6 +474,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		// Dragging takes priority over the stuck flag — re-grabbing a
 		// just-dropped postit immediately peels it again.
 		if (i === draggingIndex) return LIFT_MAX;
+		// Hold the curl during the post-drop rotation phase; the stick only
+		// begins after rotation finishes.
+		if (i === transitioningIndex) return LIFT_MAX;
 		if (i === stuckIndex) return 0;
 		if (i === hoveredIndex) return LIFT_MAX;
 		return 0;
@@ -468,7 +496,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			gsap.killTweensOf(u);
 			gsap.to(u, {
 				value: target,
-				duration: 0.45,
+				// Faster ramp on lift-up so the peel feels immediate;
+				// drop-back keeps the slower power2.out for the stick feel.
+				duration: target > 0 ? 0.25 : 0.45,
 				ease: 'power2.out',
 				onUpdate: requestRender,
 				onComplete: () => {
@@ -497,9 +527,17 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const startWorld = new THREE.Vector2();
 	const startPos = new THREE.Vector2();
 	let originalR = 0;
-	let liftR = 0;
 	let dropR = 0;
 	let topZ = postits.length;
+	let pointerDownTime = 0;
+	// Below this hold-time threshold we treat the gesture as a click: the
+	// postit jumps to the top of the stack but doesn't rotate.
+	const CLICK_THRESHOLD_MS = 200;
+	// Drag-swing state: tilt the postit while dragging based on horizontal
+	// cursor velocity. Decays toward originalR when motion stops.
+	let velocityX = 0;
+	let lastMoveX = 0;
+	let lastMoveTime = 0;
 
 	function getWorld(clientX: number, clientY: number, out: THREE.Vector2) {
 		const rect = canvas.getBoundingClientRect();
@@ -567,77 +605,132 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		gsap.killTweensOf(dragging.position);
 		gsap.killTweensOf(dragging.scale);
 		gsap.killTweensOf(dragging.rotation);
+		// If this same postit is mid post-drop transition, cancel the
+		// rotation/stick sequence so the new drag can take over cleanly.
+		if (idx === transitioningIndex) {
+			transitionTimeline?.kill();
+			transitionTimeline = null;
+			transitioningIndex = -1;
+		}
+		dragStartTimeline?.kill();
 
 		getWorld(e.clientX, e.clientY, startWorld);
 		startPos.set(dragging.position.x, dragging.position.y);
 		setHoverX(idx, startWorld.x, startWorld.y);
 		originalR = dragging.rotation.z;
-		liftR = originalR + ((Math.random() - 0.5) * 10 * Math.PI) / 180;
 		dropR = originalR + ((Math.random() - 0.5) * 14 * Math.PI) / 180;
+		// Reset swing state for this drag.
+		velocityX = 0;
+		lastMoveX = startWorld.x;
+		lastMoveTime = performance.now();
+		pointerDownTime = lastMoveTime;
 
 		topZ += 1;
-		// Two-phase unstick: while the curl ramps up (~0.4s, see applyTargets)
-		// the top stays glued — z holds at its original value. Then the
-		// sticky band releases and z snaps up to the top of the stack with
-		// a fast settle. Simulates "the top of a postit is glued and more
-		// resistant than the rest".
-		gsap.to(dragging.position, {
-			z: topZ * Z_STEP,
-			duration: 0.18,
-			delay: 0.4,
-			ease: 'expo.out',
-			onUpdate: requestRender,
+
+		// Smooth cursor-follow on xy with a tight smoothing window so the
+		// drag feels immediate but not jittery.
+		xTo = gsap.quickTo(dragging.position, 'x', {
+			duration: 0.06,
+			ease: 'power2.out',
+		});
+		yTo = gsap.quickTo(dragging.position, 'y', {
+			duration: 0.06,
+			ease: 'power2.out',
 		});
 
 		updateCoverageAndLifts();
 
 		const d = dragging;
-		gsap.to(d.scale, {
-			x: 1.004,
-			y: 1.004,
-			z: 1.004,
-			duration: 0.32,
-			ease: 'power3.in',
+		// Drag-start timeline: torsion peel → unstick (z) → rotate.
+		// Curl uniform is already ramping 0 → LIFT_MAX via applyTargets in
+		// parallel; the timeline holds z + rotation off the wall while the
+		// peel develops, then sequences them.
+		const tl = gsap.timeline({
+			onUpdate: requestRender,
 			onComplete: () => {
-				gsap.to(d.scale, {
-					x: 1.03,
-					y: 1.03,
-					z: 1.03,
-					duration: 0.28,
-					ease: 'power2.out',
-					onComplete: () => {
-						gsap.to(d.scale, {
-							x: 1.02,
-							y: 1.02,
-							z: 1.02,
-							duration: 0.2,
-							ease: 'power1.out',
-						});
-					},
-				});
-				gsap.to(d.rotation, {
-					z: liftR,
-					duration: 0.28,
-					ease: 'power2.out',
-				});
+				dragStartTimeline = null;
 			},
 		});
+		// Phase 1 (0 – 0.16s): peel torsion grows. Subtle scale "press in"
+		// while the sticky band still holds.
+		tl.to(
+			d.scale,
+			{
+				x: 1.004,
+				y: 1.004,
+				z: 1.004,
+				duration: 0.16,
+				ease: 'power3.in',
+			},
+			0,
+		);
+		// Phase 2 (0.16 – 0.32s): sticky band releases. z rises and scale
+		// pops past 1.0 so the postit "lifts off" the wall.
+		tl.to(
+			d.position,
+			{
+				z: topZ * Z_STEP,
+				duration: 0.16,
+				ease: 'expo.out',
+			},
+			0.16,
+		);
+		tl.to(
+			d.scale,
+			{
+				x: 1.03,
+				y: 1.03,
+				z: 1.03,
+				duration: 0.18,
+				ease: 'power2.out',
+			},
+			0.16,
+		);
+		// Phase 3 (0.32 – 0.5s): scale settles to the slightly-larger drag
+		// scale. No rotation here — rotation only happens on drop, so the
+		// postit holds its current angle while being dragged.
+		tl.to(
+			d.scale,
+			{
+				x: 1.02,
+				y: 1.02,
+				z: 1.02,
+				duration: 0.18,
+				ease: 'power1.out',
+			},
+			0.32,
+		);
+		dragStartTimeline = tl;
 	}
 
 	const wp = new THREE.Vector2();
 	function onPointerMove(e: PointerEvent) {
 		if (dragging) {
 			getWorld(e.clientX, e.clientY, wp);
+			// Update horizontal velocity from this pointer event for the
+			// drag-swing tilt. Low-pass filter so single-frame jitter doesn't
+			// flick the rotation.
+			const now = performance.now();
+			if (lastMoveTime > 0) {
+				const dt = (now - lastMoveTime) / 1000;
+				if (dt > 0) {
+					const instant = (wp.x - lastMoveX) / dt;
+					velocityX = velocityX * 0.5 + instant * 0.5;
+				}
+			}
+			lastMoveX = wp.x;
+			lastMoveTime = now;
 			const dx = wp.x - startWorld.x;
 			const dy = wp.y - startWorld.y;
-			dragging.position.x = Math.max(
-				0,
-				Math.min(PAPER_W, startPos.x + dx),
-			);
-			dragging.position.y = Math.max(
-				0,
-				Math.min(PAPER_H, startPos.y + dy),
-			);
+			const targetX = Math.max(0, Math.min(PAPER_W, startPos.x + dx));
+			const targetY = Math.max(0, Math.min(PAPER_H, startPos.y + dy));
+			if (xTo && yTo) {
+				xTo(targetX);
+				yTo(targetY);
+			} else {
+				dragging.position.x = targetX;
+				dragging.position.y = targetY;
+			}
 			// Cursor offset relative to the dragged postit stays fixed during
 			// drag, so the curl bias keeps pointing at the grabbed side.
 			setHoverX(draggingIndex, wp.x, wp.y);
@@ -669,23 +762,93 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	function onPointerUp() {
 		if (!dragging) return;
 		const d = dragging;
-		releaseHoverX(draggingIndex);
-		// Mark this postit as freshly stuck — its lift animates back to 0
-		// and stays flat even though the cursor is still over it.
-		stuckIndex = draggingIndex;
+		const droppedIdx = draggingIndex;
+		releaseHoverX(droppedIdx);
+		// Phase 1 (rotation only): postit holds curl + scale, rotates to its
+		// final orientation. transitioningIndex keeps targetLiftFor pinned at
+		// LIFT_MAX so the stick can't begin yet.
+		transitioningIndex = droppedIdx;
 		dragging = null;
 		draggingIndex = -1;
+		// Stop tracking cursor so a stray pointermove can't yank the
+		// no-longer-dragged postit's xy.
+		xTo = null;
+		yTo = null;
 		gsap.killTweensOf(d.scale);
 		gsap.killTweensOf(d.rotation);
-		gsap.to(d.scale, {
-			x: 1,
-			y: 1,
-			z: 1,
-			duration: 0.35,
-			ease: 'expo.out',
+		transitionTimeline?.kill();
+		dragStartTimeline?.kill();
+
+		// Click vs drag: short hold counts as a click — the postit just
+		// jumps to the top of the stack without rotation.
+		const heldDuration = performance.now() - pointerDownTime;
+		if (heldDuration < CLICK_THRESHOLD_MS) {
+			dropR = d.rotation.z; // suppress rotation
+		}
+
+		const tl = gsap.timeline({
+			onComplete: () => {
+				transitionTimeline = null;
+			},
 		});
-		gsap.to(d.rotation, { z: dropR, duration: 0.9, ease: 'expo.out' });
-		updateCoverageAndLifts();
+		// Phase 1 (parallel): rotate to dropR + finish the z rise. The drag
+		// start may have been killed before z reached topZ * Z_STEP (e.g.
+		// quick click), so we always tween z back up here. Rotation
+		// duration scales with distance — small distance ≈ 0 duration.
+		const rotDistance = Math.abs(dropR - d.rotation.z);
+		const rotDuration = Math.min(0.8, rotDistance * 3);
+		const targetZ = topZ * Z_STEP;
+		const zDuration = Math.abs(d.position.z - targetZ) > 1e-5 ? 0.18 : 0;
+		const phase1End = Math.max(rotDuration, zDuration);
+		tl.to(
+			d.position,
+			{
+				z: targetZ,
+				duration: zDuration,
+				ease: 'expo.out',
+				onUpdate: requestRender,
+			},
+			0,
+		);
+		tl.to(
+			d.rotation,
+			{
+				z: dropR,
+				duration: rotDuration,
+				ease: 'power2.inOut',
+				onUpdate: requestRender,
+			},
+			0,
+		);
+		// Hand-off to the stick phase: clear the transition flag, mark stuck,
+		// and let updateCoverageAndLifts animate lift back to 0. Fires once
+		// both the rotation and z tweens above have completed.
+		tl.call(
+			() => {
+				transitioningIndex = -1;
+				stuckIndex = droppedIdx;
+				updateCoverageAndLifts();
+				requestRender();
+			},
+			undefined,
+			phase1End,
+		);
+		// Phase 2 (stick): scale settles to 1 alongside the lift drop.
+		// Rotation is already at dropR — no rotation tween here, so it can't
+		// keep moving while the postit is gluing to the wall.
+		tl.to(
+			d.scale,
+			{
+				x: 1,
+				y: 1,
+				z: 1,
+				duration: 0.35,
+				ease: 'expo.out',
+				onUpdate: requestRender,
+			},
+			phase1End,
+		);
+		transitionTimeline = tl;
 	}
 
 	function onPointerLeave() {
@@ -706,6 +869,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		destroy() {
 			cancelAnimationFrame(raf);
 			gsap.ticker.remove(requestRender);
+			gsap.ticker.remove(updateDragSwing);
 			ro.disconnect();
 			canvas.removeEventListener('pointerdown', onPointerDown);
 			canvas.removeEventListener('pointerleave', onPointerLeave);
