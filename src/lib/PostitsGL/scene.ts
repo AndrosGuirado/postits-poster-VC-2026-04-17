@@ -11,7 +11,7 @@ export type PostitData = {
 };
 
 const SVG_W = 141;
-const SVG_H = 60;
+const SVG_H = 100;
 const PAPER_W = 1;
 const PAPER_H = 297 / 210;
 const POSTIT_W = 0.38;
@@ -355,7 +355,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	const sun = new THREE.DirectionalLight(0xffffff, 2.5);
 	// Upper-left: small x, large y (since camera is Y-up now).
-	sun.position.set(0.33, PAPER_H - 0.5, 2.0);
+	sun.position.set(-0.47, PAPER_H, 2.5);
 	sun.target.position.set(PAPER_W / 2, PAPER_H / 2, 0);
 	sun.castShadow = true;
 	sun.shadow.mapSize.set(2048, 2048);
@@ -369,9 +369,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	// receiver's check overshoots the caster's depth and postit-on-postit
 	// shadow disappears. Also clears self-shadow stripes from the curl.
 	sun.shadow.bias = 0;
-	sun.shadow.normalBias = 0.0007;
+	sun.shadow.normalBias = 0.001;
 	// Larger radius = softer PCF blur, less crispy shadow edge.
-	sun.shadow.radius = 2;
+	sun.shadow.radius = 2.0;
 	scene.add(sun);
 	scene.add(sun.target);
 
@@ -529,6 +529,11 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	// LIFT_MAX during rotation so the postit can't visually "stick" until
 	// it has finished orienting itself.
 	let transitioningIndex = -1;
+	// Postit whose drop animation is currently sequencing through the two
+	// phases (top-stick → rest-falls). applyTargets skips this index so its
+	// lift uniform stays under the timeline's control while other postits'
+	// coverage updates run normally.
+	let droppingIndex = -1;
 	let transitionTimeline: gsap.core.Timeline | null = null;
 	let dragStartTimeline: gsap.core.Timeline | null = null;
 	// quickTo handlers for smooth cursor-follow on the dragged postit's xy.
@@ -588,6 +593,9 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			// (curl overshoot for the peel feel). Skip here so we don't fight
 			// that tween on every coverage update during drag.
 			if (i === draggingIndex) continue;
+			// The dropping postit's lift is owned by the drop timeline
+			// (two-step retraction: top-stick then rest-falls). Same gate.
+			if (i === droppingIndex) continue;
 			const target = targetLiftFor(i);
 			const u = mats[i].lift;
 			const mesh = yellowMeshes[i];
@@ -892,10 +900,11 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		const d = dragging;
 		const droppedIdx = draggingIndex;
 		releaseHoverX(droppedIdx);
-		// Phase 1 (rotation only): postit holds curl + scale, rotates to its
-		// final orientation. transitioningIndex keeps targetLiftFor pinned at
-		// LIFT_MAX so the stick can't begin yet.
 		transitioningIndex = droppedIdx;
+		// Take ownership of this postit's lift uniform for the whole drop
+		// sequence. applyTargets is gated on droppingIndex, so coverage
+		// updates can't interrupt the two-phase tween below.
+		droppingIndex = droppedIdx;
 		dragging = null;
 		draggingIndex = -1;
 		// Stop tracking cursor so a stray pointermove can't yank the
@@ -904,13 +913,10 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		yTo = null;
 		gsap.killTweensOf(d.scale);
 		gsap.killTweensOf(d.rotation);
+		gsap.killTweensOf(mats[droppedIdx].lift);
 		transitionTimeline?.kill();
 		dragStartTimeline?.kill();
 		dragStartTimeline = null;
-		// Settle lift to LIFT_MAX in case the drag-start peel-overshoot
-		// got killed mid-curl. transitioningIndex (set just above) makes
-		// applyTargets target LIFT_MAX for the dropped postit.
-		applyTargets();
 
 		// Click vs drag: short hold reverts the pickup-twist back to the
 		// pre-grab angle (postit "settles flat"); a real drag settles the
@@ -924,16 +930,38 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				transitionTimeline = null;
 			},
 		});
-		// Rotate to dropR and settle z back down to the resting top-rank
-		// layer. Rotation duration scales with distance — a click with
-		// barely any twist resolves almost instantly. The z tween reverses
-		// the perspective scale-up the drag-start put on, so the postit
-		// visibly recedes back toward the wall as the curl retracts.
+		// Two-step drop:
+		//   Phase 1 (top sticks): uLift retracts from peak (peel front in
+		//     the sticky band) back to LIFT_MAX. The shader's ease-in
+		//     stickyT pulls peelFrontY out of the sticky band quickly,
+		//     so the top edge re-engages while the loose paper is still
+		//     curled. Rotation + z run in parallel — postit lands at its
+		//     resting angle/depth as the sticky band re-attaches.
+		//   Phase 2 (rest falls): uLift continues from LIFT_MAX to 0.
+		//     Peel front slides back through the loose region to the
+		//     bottom edge. Slower than the standard ramp so the unstick
+		//     reads legibly in reverse.
 		const rotDistance = Math.abs(dropR - d.rotation.z);
 		const rotDuration = Math.min(0.8, rotDistance * 3);
 		const targetRestZ = stackRank[droppedIdx] * Z_STEP;
-		const zDuration = 0.4;
-		const phase1End = Math.max(rotDuration, zDuration);
+		const zDuration = 0.5;
+		const PHASE1_LIFT_DURATION = 0.6;
+		const PHASE2_LIFT_DURATION = 0.8;
+		const phase1End = Math.max(
+			rotDuration,
+			zDuration,
+			PHASE1_LIFT_DURATION,
+		);
+		tl.to(
+			mats[droppedIdx].lift,
+			{
+				value: LIFT_MAX,
+				duration: PHASE1_LIFT_DURATION,
+				ease: 'power2.inOut',
+				onUpdate: requestRender,
+			},
+			0,
+		);
 		tl.to(
 			d.rotation,
 			{
@@ -958,10 +986,28 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			() => {
 				transitioningIndex = -1;
 				stuckIndex = droppedIdx;
+				// Recompute coverage + sync other postits' lift state.
+				// droppingIndex is still set, so applyTargets skips this
+				// postit and leaves phase 2 tween alone.
 				updateCoverageAndLifts();
 				requestRender();
 			},
 			undefined,
+			phase1End,
+		);
+		tl.to(
+			mats[droppedIdx].lift,
+			{
+				value: 0,
+				duration: PHASE2_LIFT_DURATION,
+				ease: 'power2.inOut',
+				onUpdate: requestRender,
+				onComplete: () => {
+					droppingIndex = -1;
+					yellowMeshes[droppedIdx].receiveShadow = true;
+					requestRender();
+				},
+			},
 			phase1End,
 		);
 		transitionTimeline = tl;
