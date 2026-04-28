@@ -31,7 +31,13 @@ const STICKY_FRACTION = 0.2;
 // this curls; anything above stays flat.
 const STICKY_END_Y = POSTIT_HALF_H - STICKY_FRACTION * SVG_H * POSTIT_SCALE;
 const LIFT_MAX = 0.03; // peak z-lift at the bottom edge
-const PLANE_Y_SEGS = 32;
+// Tessellation density along Y for the yellow plane. Higher = the
+// piecewise-linear yellow surface tracks the curl curve more tightly,
+// which shrinks the chord-deviation gap between yellow's segment chords
+// and text triangle chords (text has its own independent triangulation).
+// 96 keeps z-fight stripes in check during heavy curl without becoming
+// a measurable shader-cost.
+const PLANE_Y_SEGS = 96;
 // Curl is invisible under an orthographic projection unless the paper also
 // shortens visibly. Pulling lifted vertices back toward the sticky band fakes
 // the foreshortening of the paper rolling toward the viewer.
@@ -64,10 +70,12 @@ function buildSharedGeometries(): SharedGeometries {
 			// screen. This inverts face winding — the lit material below
 			// compensates for that in onBeforeCompile.
 			g.scale(1, -1, 1);
-			// Tiny static offset just to break the flat-on-flat z-fight when
-			// the postit is stuck (no curl). The dynamic offset that scales
-			// with uLift is added in the black material's vertex shader so
-			// chord-deviation stripes stay away during curl.
+			// Tiny static lift to break flat-on-flat z-fight when the
+			// postit is stuck (no curl). Must stay well below Z_STEP
+			// (0.001) so text on postit N never crosses the yellow plane
+			// of postit N+1. The heavy lifting against curl-driven z-
+			// fight is done by the curl-proportional textBoost in the
+			// shader plus the polygonOffset on the black material.
 			g.translate(0, 0, 0.0001);
 			blackPaths.push(g);
 		});
@@ -109,14 +117,20 @@ function buildCurlInjection(
 	textBoost = false,
 ) {
 	const stickyEnd = STICKY_END_Y.toFixed(6);
+	const posHalfH = POSTIT_HALF_H.toFixed(6);
 	const negHalfH = (-POSTIT_HALF_H).toFixed(6);
 	const curlY = CURL_Y_RATIO.toFixed(6);
 	const halfW = POSTIT_HALF_W.toFixed(6);
-	// Black text gets an extra z lift that scales with the curl. Without it,
-	// linear interpolation across text triangles drops below the yellow
-	// plane's denser-tessellation curve in the curl's concave region and
-	// produces visible stripes through the letters.
-	const textBoostLine = textBoost ? 'transformed.z += uLift * 0.3;' : '';
+	const liftMax = LIFT_MAX.toFixed(6);
+	// Black text gets an extra z lift proportional to the yellow plane's
+	// own curl displacement. Without it, linear interpolation across text
+	// triangles drops below the yellow plane's denser-tessellation curve
+	// in the curl's concave region and produces visible stripes through
+	// the letters. Tying the boost to curlAmount (instead of just uLift)
+	// makes it track asymmetry too — when the cursor is near a side and
+	// yellow's curl is amplified up to 2.5×, the text boost scales with
+	// it instead of falling behind.
+	const textBoostLine = textBoost ? 'transformed.z += curlAmount * 2.5;' : '';
 
 	return (shader: {
 		uniforms: Record<string, unknown>;
@@ -134,13 +148,69 @@ function buildCurlInjection(
 			.replace(
 				'#include <begin_vertex>',
 				`#include <begin_vertex>
-				float curlT = smoothstep(${stickyEnd}, ${negHalfH}, position.y);
+				// Two-phase peel:
+				//   uLift in [0, LIFT_MAX] (the hover range): peel front
+				//     moves bottom → sticky-band boundary. Loose paper
+				//     bends progressively; sticky band stays flat.
+				//   uLift > LIFT_MAX (pickup over-pull): peel front
+				//     continues into the sticky band itself, up toward
+				//     posHalfH. The sticky band releases — the whole
+				//     postit unsticks from the wall. Full unstick at
+				//     uLift = LIFT_MAX * 1.5 (the 0.5 over-range below).
+				// Hover ends at the sticky-band boundary; pickup pushes
+				// past it.
+				float liftN = uLift / ${liftMax};
+				float looseT = clamp(liftN, 0.0, 1.0);
+				float rawStickyT = clamp((liftN - 1.0) / 0.5, 0.0, 1.0);
+				// Ease-in peel front: paper lingers in the loose region
+				// before the peel breaches the sticky band, then releases
+				// rapidly. Combined with the bell-shaped magnitude surge
+				// below, the top edge reads as glued — fighting hardest
+				// while the peel is mid-sticky-band, then snapping free.
+				float stickyT = pow(rawStickyT, 2.5);
+				float peelFrontY = mix(${negHalfH}, ${stickyEnd}, max(looseT, 0.001))
+					+ stickyT * (${posHalfH} - ${stickyEnd});
+				float curlT = smoothstep(peelFrontY, ${negHalfH}, position.y);
 				float curlT2 = curlT * curlT;
 				float xNorm = position.x / ${halfW};
-				float asymmetry = max(0.0, 1.0 + uHoverX * xNorm * 1.5);
-				float curlAmount = curlT2 * uLift * asymmetry;
+				// Slope is 1.0 (not 1.5) so the max(0,…) clamp kink lands
+				// exactly at xNorm = ±1 (the postit edge) for the extreme
+				// uHoverX = ±1 case. The yellow plane only has 1 X-segment
+				// (vertices at xNorm = ±1), so its bilinear interp matches
+				// the true asymmetry function across the interior — no
+				// chord deviation in X, no z-fight stripes when the cursor
+				// is at a side and the curl is at its most asymmetric.
+				float asymmetry = max(0.0, 1.0 + uHoverX * xNorm * 1.0);
+				// Magnitude has two regimes:
+				//   Hover (liftN 0→1): peels with full torsion, peaks at
+				//     LIFT_MAX so the peel reads strongly even before
+				//     committing to a pickup.
+				//   Pickup (liftN 1→1.5): bell-shaped surge starting from
+				//     LIFT_MAX (continuous with hover peak so there's no
+				//     pop at the transition), peaking while the peel
+				//     front is mid-sticky-band (where glue resistance is
+				//     strongest), then dropping to LIFT_MAX * 0.2 once
+				//     the band releases — at that point the global
+				//     unstick lift below carries the postit forward
+				//     instead of curling it harder.
+				float hoverMag = looseT * ${liftMax} * 1.0;
+				float fightBell = 4.0 * stickyT * (1.0 - stickyT);
+				float pickupMag = mix(${liftMax}, ${liftMax} * 0.2, rawStickyT)
+					+ fightBell * ${liftMax} * 0.9;
+				float magnitude = mix(hoverMag, pickupMag, step(1.0, liftN));
+				float curlAmount = curlT2 * magnitude * asymmetry;
 				transformed.y += curlAmount * ${curlY};
 				transformed.z += curlAmount;
+				// Global unstick lift: when the sticky band releases
+				// (stickyT > 0), the whole paper translates outward in z
+				// — toward the camera, away from the wall. The ortho
+				// camera flattens the z move on screen, but the shadow
+				// it casts on the wall slides away from the postit edge,
+				// which is what reads visually as "off the wall." The
+				// multiplier is intentionally aggressive (3 × LIFT_MAX)
+				// so the gap between the postit and its shadow is the
+				// dominant visual at peak unstick.
+				transformed.z += stickyT * ${liftMax} * 3.0;
 				${textBoostLine}`,
 			);
 	};
@@ -188,6 +258,14 @@ function makePostitMaterials(): PostitMaterials {
 	const black = new THREE.MeshBasicMaterial({
 		color: 0x000000,
 		side: THREE.DoubleSide,
+		// No polygonOffset: even with factor=0, units interpretation isn't
+		// perfectly portable across GPUs and can overshoot Z_STEP in some
+		// configurations, causing text from one postit to leak in front of
+		// the next. Z separation is handled entirely in object space:
+		//   • static 0.0001 translate (in buildSharedGeometries) for flat
+		//     state (uLift=0)
+		//   • curlAmount * 1.5 in the vertex shader for curled state
+		// Both are bounded and stay well below Z_STEP.
 	});
 	black.onBeforeCompile = (shader) => injectCurlText(shader);
 
@@ -198,25 +276,33 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const scene = new THREE.Scene();
 	scene.background = new THREE.Color(WHITE);
 
-	// Standard Y-up ortho cam (top=PAPER_H, bottom=0). The previous Y-down
-	// setup (top=0, bottom=PAPER_H) was breaking three.js's directional-light
-	// view-space transform, which is why no shadow appeared and Sun > intensity
-	// had no effect. Postit positions and pointer mapping are flipped below.
-	const camera = new THREE.OrthographicCamera(
-		0,
-		PAPER_W,
-		PAPER_H,
-		0,
-		-100,
-		100,
-	);
-	camera.position.z = 10;
+	// Perspective camera, framed so the paper plane (z=0) fills exactly the
+	// same PAPER_W × PAPER_H region the previous ortho cam covered. The
+	// 30° FOV is narrow enough that postits near the edges don't distort
+	// noticeably, but wide enough that z-lifted postits (drag state) visibly
+	// scale up — the cue that was missing under ortho, where z only shifted
+	// the shadow. The camera distance is derived from the FOV so a future
+	// FOV tweak doesn't require re-zeroing the framing.
+	const FOV_DEG = 30;
+	const aspect = PAPER_W / PAPER_H;
+	const cameraDistance =
+		PAPER_H / 2 / Math.tan((FOV_DEG * Math.PI) / 180 / 2);
+	const camera = new THREE.PerspectiveCamera(FOV_DEG, aspect, 0.1, 100);
+	camera.position.set(PAPER_W / 2, PAPER_H / 2, cameraDistance);
+	camera.lookAt(PAPER_W / 2, PAPER_H / 2, 0);
 
 	const sharedGeos = buildSharedGeometries();
 
 	const groups: THREE.Group[] = [];
 	const mats: PostitMaterials[] = [];
 	const yellowMeshes: THREE.Mesh[] = [];
+
+	// Tweakpane-tunable params. Held on an object so addBinding can mutate
+	// them; consumed in onPointerDown / onPointerUp at gesture time, so live
+	// edits take effect on the next grab without needing a re-render.
+	const dragParams = {
+		liftZ: 0.025,
+	};
 
 	postits.forEach((p, idx) => {
 		const m = makePostitMaterials();
@@ -269,7 +355,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	const sun = new THREE.DirectionalLight(0xffffff, 2.5);
 	// Upper-left: small x, large y (since camera is Y-up now).
-	sun.position.set(0.33, PAPER_H - 0.15, 2.0);
+	sun.position.set(0.33, PAPER_H - 0.5, 2.0);
 	sun.target.position.set(PAPER_W / 2, PAPER_H / 2, 0);
 	sun.castShadow = true;
 	sun.shadow.mapSize.set(2048, 2048);
@@ -283,7 +369,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	// receiver's check overshoots the caster's depth and postit-on-postit
 	// shadow disappears. Also clears self-shadow stripes from the curl.
 	sun.shadow.bias = 0;
-	sun.shadow.normalBias = 0.0005;
+	sun.shadow.normalBias = 0.0007;
 	// Larger radius = softer PCF blur, less crispy shadow edge.
 	sun.shadow.radius = 2;
 	scene.add(sun);
@@ -360,10 +446,10 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		.addBinding(sun.position, 'y', { min: -2, max: 2, step: 0.001 })
 		.on('change', onLightChange);
 	sunFolder
-		.addBinding(sun.position, 'z', { min: 0.01, max: 2, step: 0.001 })
+		.addBinding(sun.position, 'z', { min: 0.01, max: 3, step: 0.001 })
 		.on('change', onLightChange);
 	sunFolder
-		.addBinding(sun, 'intensity', { min: 0, max: 3, step: 0.05 })
+		.addBinding(sun, 'intensity', { min: 0, max: 4, step: 0.05 })
 		.on('change', requestRender);
 
 	const shadowFolder = pane.addFolder({ title: 'Shadow' });
@@ -390,7 +476,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 })
 		.on('change', requestRender);
 	shadowFolder
-		.addBinding(ambient, 'intensity', { min: 0, max: 1.5, step: 0.05 })
+		.addBinding(ambient, 'intensity', { min: 0, max: 4, step: 0.05 })
 		.on('change', requestRender);
 	shadowFolder
 		.addBinding(wall.position, 'z', {
@@ -399,18 +485,32 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			step: 0.001,
 		})
 		.on('change', requestRender);
+
+	const dragFolder = pane.addFolder({ title: 'Drag' });
+	dragFolder.addBinding(dragParams, 'liftZ', {
+		label: 'lift z',
+		min: 0.0,
+		max: 0.5,
+		step: 0.001,
+	});
 	//}
 
 	// ---------- Drag swing (velocity-driven tilt) ----------
 	// Each frame: decay the horizontal velocity, compute a bounded tilt
 	// (tanh-saturated so quick flicks don't over-rotate), and lerp the
-	// dragged postit's rotation.z toward originalR + tilt.
+	// dragged postit's rotation.z toward pickupR + tilt. Centered on
+	// pickupR (the twisted angle from grab) so the swing oscillates
+	// around the new orientation, not the pre-grab one.
 	function updateDragSwing() {
 		if (!dragging) return;
+		// Skip while the pickup timeline is still tweening rotation, or our
+		// 20% lerp fights the gsap tween frame-by-frame and produces a
+		// visible rebound on grab.
+		if (dragStartTimeline) return;
 		velocityX *= 0.85;
 		// Saturate around ~10° max swing (0.18 rad).
 		const tilt = Math.tanh(velocityX * 0.4) * 0.18;
-		const target = originalR - tilt;
+		const target = pickupR - tilt;
 		dragging.rotation.z += (target - dragging.rotation.z) * 0.2;
 		requestRender();
 	}
@@ -484,6 +584,10 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	function applyTargets() {
 		for (let i = 0; i < groups.length; i++) {
+			// The dragged postit's lift is owned by the drag-start timeline
+			// (curl overshoot for the peel feel). Skip here so we don't fight
+			// that tween on every coverage update during drag.
+			if (i === draggingIndex) continue;
 			const target = targetLiftFor(i);
 			const u = mats[i].lift;
 			const mesh = yellowMeshes[i];
@@ -527,14 +631,36 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const startWorld = new THREE.Vector2();
 	const startPos = new THREE.Vector2();
 	let originalR = 0;
-	let dropR = 0;
-	let topZ = postits.length;
+	// Twisted angle picked at grab time. The pickup tween rotates from
+	// originalR → pickupR (twist on grab); the drag swing oscillates around
+	// pickupR; on drop a real drag settles back to pickupR while a click
+	// reverts to originalR (untwist).
+	let pickupR = 0;
+	// Stack rank per postit: 0 = bottom layer, postits.length - 1 = top.
+	// Rank shifts on each grab so the most-recently-touched postit lands
+	// at the top without z accumulating globally — drop z stays bounded
+	// at (postits.length - 1) * Z_STEP no matter how many grabs happened.
+	const stackRank: number[] = postits.map((_, idx) => idx);
+	const TOP_RANK = postits.length - 1;
+	function bringToTop(idx: number) {
+		const oldRank = stackRank[idx];
+		if (oldRank === TOP_RANK) return;
+		for (let i = 0; i < stackRank.length; i++) {
+			if (i === idx) continue;
+			if (stackRank[i] > oldRank) {
+				stackRank[i] -= 1;
+				groups[i].position.z = stackRank[i] * Z_STEP;
+			}
+		}
+		stackRank[idx] = TOP_RANK;
+	}
+
 	let pointerDownTime = 0;
 	// Below this hold-time threshold we treat the gesture as a click: the
-	// postit jumps to the top of the stack but doesn't rotate.
+	// postit jumps to the top of the stack and untwists back to originalR.
 	const CLICK_THRESHOLD_MS = 200;
 	// Drag-swing state: tilt the postit while dragging based on horizontal
-	// cursor velocity. Decays toward originalR when motion stops.
+	// cursor velocity. Decays toward pickupR when motion stops.
 	let velocityX = 0;
 	let lastMoveX = 0;
 	let lastMoveTime = 0;
@@ -605,6 +731,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		gsap.killTweensOf(dragging.position);
 		gsap.killTweensOf(dragging.scale);
 		gsap.killTweensOf(dragging.rotation);
+		gsap.killTweensOf(mats[idx].lift);
 		// If this same postit is mid post-drop transition, cancel the
 		// rotation/stick sequence so the new drag can take over cleanly.
 		if (idx === transitioningIndex) {
@@ -618,14 +745,25 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		startPos.set(dragging.position.x, dragging.position.y);
 		setHoverX(idx, startWorld.x, startWorld.y);
 		originalR = dragging.rotation.z;
-		dropR = originalR + ((Math.random() - 0.5) * 14 * Math.PI) / 180;
+		pickupR = originalR;
 		// Reset swing state for this drag.
 		velocityX = 0;
 		lastMoveX = startWorld.x;
 		lastMoveTime = performance.now();
 		pointerDownTime = lastMoveTime;
 
-		topZ += 1;
+		// Promote the grabbed postit to the top of the stack and shift
+		// every postit that was above it down by one rank — instant z
+		// updates, but each of those is just one Z_STEP (≈ 0.038% scale
+		// change under the perspective cam, imperceptible). Drop z is
+		// then bounded at TOP_RANK * Z_STEP no matter how many grabs.
+		bringToTop(idx);
+		// Target z for the dragged postit during the drag — visibly lifted
+		// toward the viewer under the perspective cam. Tweened in the
+		// drag-start timeline below; under perspective an instant z change
+		// shows up as an instant scale jump on grab. Read off dragParams
+		// so tweakpane edits take effect on the next grab.
+		const targetDragZ = dragParams.liftZ;
 
 		// Smooth cursor-follow on xy with a tight smoothing window so the
 		// drag feels immediate but not jittery.
@@ -640,65 +778,55 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 		updateCoverageAndLifts();
 
-		const d = dragging;
-		// Drag-start timeline: torsion peel → unstick (z) → rotate.
-		// Curl uniform is already ramping 0 → LIFT_MAX via applyTargets in
-		// parallel; the timeline holds z + rotation off the wall while the
-		// peel develops, then sequences them.
+		// Drag-start timeline owns the lift uniform during pickup (see the
+		// gate in applyTargets that skips the dragged postit). Only the
+		// curl is animated — z is already at the top layer (set instantly
+		// above), rotation is left alone for the swing to handle.
 		const tl = gsap.timeline({
 			onUpdate: requestRender,
 			onComplete: () => {
 				dragStartTimeline = null;
 			},
 		});
-		// Phase 1 (0 – 0.16s): peel torsion grows. Subtle scale "press in"
-		// while the sticky band still holds.
+		// Pickup is the same shape as hover (curl propagating from bottom
+		// up) but more dramatic and pushed past where hover stops:
+		//   • Hover ramps uLift to LIFT_MAX → peel front lands at the
+		//     sticky-band boundary, loose paper fully bent.
+		//   • Pickup ramps uLift to LIFT_MAX * 1.5 → the over-pull drives
+		//     the peel front into the sticky band itself (see shader),
+		//     amplifies the curl magnitude (more torsion at the bottom),
+		//     and triggers the global unstick lift that translates the
+		//     previously-stuck top edge upward and outward.
+		// power3.out concentrates time near the end of the ramp, where
+		// the peel is climbing through the sticky band and the global
+		// lift is engaging — that tail is the "glue resistance" to the
+		// final unstick. Rotation is not touched on grab; the only
+		// rotation during a gesture is the velocity-driven swing in
+		// updateDragSwing while the user actually moves the cursor.
 		tl.to(
-			d.scale,
+			mats[idx].lift,
 			{
-				x: 1.004,
-				y: 1.004,
-				z: 1.004,
-				duration: 0.16,
-				ease: 'power3.in',
+				value: LIFT_MAX * 1.5,
+				duration: 0.5,
+				ease: 'power3.out',
+				onUpdate: requestRender,
 			},
 			0,
 		);
-		// Phase 2 (0.16 – 0.32s): sticky band releases. z rises and scale
-		// pops past 1.0 so the postit "lifts off" the wall.
+		// Smooth z lift toward targetDragZ. Snapping z under the
+		// perspective cam manifests as an instant scale jump on grab;
+		// tweening on the same arc as the curl makes the postit appear to
+		// rise toward the viewer in step with the peel. Layering settles
+		// within the first ~100ms of the power3.out curve since z
+		// surpasses every other postit very early.
 		tl.to(
-			d.position,
+			dragging.position,
 			{
-				z: topZ * Z_STEP,
-				duration: 0.16,
-				ease: 'expo.out',
+				z: targetDragZ,
+				duration: 0.5,
+				ease: 'power3.out',
 			},
-			0.16,
-		);
-		tl.to(
-			d.scale,
-			{
-				x: 1.03,
-				y: 1.03,
-				z: 1.03,
-				duration: 0.18,
-				ease: 'power2.out',
-			},
-			0.16,
-		);
-		// Phase 3 (0.32 – 0.5s): scale settles to the slightly-larger drag
-		// scale. No rotation here — rotation only happens on drop, so the
-		// postit holds its current angle while being dragged.
-		tl.to(
-			d.scale,
-			{
-				x: 1.02,
-				y: 1.02,
-				z: 1.02,
-				duration: 0.18,
-				ease: 'power1.out',
-			},
-			0.32,
+			0,
 		);
 		dragStartTimeline = tl;
 	}
@@ -778,38 +906,34 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		gsap.killTweensOf(d.rotation);
 		transitionTimeline?.kill();
 		dragStartTimeline?.kill();
+		dragStartTimeline = null;
+		// Settle lift to LIFT_MAX in case the drag-start peel-overshoot
+		// got killed mid-curl. transitioningIndex (set just above) makes
+		// applyTargets target LIFT_MAX for the dropped postit.
+		applyTargets();
 
-		// Click vs drag: short hold counts as a click — the postit just
-		// jumps to the top of the stack without rotation.
+		// Click vs drag: short hold reverts the pickup-twist back to the
+		// pre-grab angle (postit "settles flat"); a real drag settles the
+		// swing-tilt back to pickupR (the twisted angle is kept).
 		const heldDuration = performance.now() - pointerDownTime;
-		if (heldDuration < CLICK_THRESHOLD_MS) {
-			dropR = d.rotation.z; // suppress rotation
-		}
+		const isClick = heldDuration < CLICK_THRESHOLD_MS;
+		const dropR = isClick ? originalR : pickupR;
 
 		const tl = gsap.timeline({
 			onComplete: () => {
 				transitionTimeline = null;
 			},
 		});
-		// Phase 1 (parallel): rotate to dropR + finish the z rise. The drag
-		// start may have been killed before z reached topZ * Z_STEP (e.g.
-		// quick click), so we always tween z back up here. Rotation
-		// duration scales with distance — small distance ≈ 0 duration.
+		// Rotate to dropR and settle z back down to the resting top-rank
+		// layer. Rotation duration scales with distance — a click with
+		// barely any twist resolves almost instantly. The z tween reverses
+		// the perspective scale-up the drag-start put on, so the postit
+		// visibly recedes back toward the wall as the curl retracts.
 		const rotDistance = Math.abs(dropR - d.rotation.z);
 		const rotDuration = Math.min(0.8, rotDistance * 3);
-		const targetZ = topZ * Z_STEP;
-		const zDuration = Math.abs(d.position.z - targetZ) > 1e-5 ? 0.18 : 0;
+		const targetRestZ = stackRank[droppedIdx] * Z_STEP;
+		const zDuration = 0.4;
 		const phase1End = Math.max(rotDuration, zDuration);
-		tl.to(
-			d.position,
-			{
-				z: targetZ,
-				duration: zDuration,
-				ease: 'expo.out',
-				onUpdate: requestRender,
-			},
-			0,
-		);
 		tl.to(
 			d.rotation,
 			{
@@ -820,9 +944,16 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			},
 			0,
 		);
-		// Hand-off to the stick phase: clear the transition flag, mark stuck,
-		// and let updateCoverageAndLifts animate lift back to 0. Fires once
-		// both the rotation and z tweens above have completed.
+		tl.to(
+			d.position,
+			{
+				z: targetRestZ,
+				duration: zDuration,
+				ease: 'power2.inOut',
+				onUpdate: requestRender,
+			},
+			0,
+		);
 		tl.call(
 			() => {
 				transitioningIndex = -1;
@@ -831,21 +962,6 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				requestRender();
 			},
 			undefined,
-			phase1End,
-		);
-		// Phase 2 (stick): scale settles to 1 alongside the lift drop.
-		// Rotation is already at dropR — no rotation tween here, so it can't
-		// keep moving while the postit is gluing to the wall.
-		tl.to(
-			d.scale,
-			{
-				x: 1,
-				y: 1,
-				z: 1,
-				duration: 0.35,
-				ease: 'expo.out',
-				onUpdate: requestRender,
-			},
 			phase1End,
 		);
 		transitionTimeline = tl;
