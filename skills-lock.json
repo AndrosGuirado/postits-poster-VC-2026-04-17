@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "skills": {
+    "accessibility": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/accessibility/SKILL.md",
+      "computedHash": "67f3971da693bf7a9c63351c29a98e044e7d15347cf5a6bb625f7302979de0b5"
+    },
+    "autoskill": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-automation/skills/autoskill/SKILL.md",
+      "computedHash": "244019b729655590565c443381efb37583a87aff72ba490605fcb04d360f5105"
+    },
+    "awwwards-animations": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/awwwards-animations/SKILL.md",
+      "computedHash": "706bc2fb16cfd49cc1d89d6a96b02b5b5987493cd2e3b19c946778909d5ef618"
+    },
+    "awwwards-landing-page": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/awwwards-landing-page/SKILL.md",
+      "computedHash": "7b9fe005bd664db3d8e0cde36a3750958de3bdb8f8a8d2ec0116dbd0261e1fa4"
+    },
+    "brand-strategy-agent": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/brand/SKILL.md",
+      "computedHash": "139dba37da840ce03a007b93bbb06055bd418695867a697b5099783ba7366943"
+    },
+    "cmux": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-automation/skills/cmux/SKILL.md",
+      "computedHash": "fde8409ebe6ec66d64ce7e63f5bb31ed08e96666b645e78dd8ea27f063f91430"
+    },
+    "creative-director": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/creative-director/SKILL.md",
+      "computedHash": "b6a1129d5e87450b6efe6f28b222d9d3174e71b9fcfd72d62f5bdab9a9b5d933"
+    },
+    "design-taste-frontend": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/design-taste-frontend/SKILL.md",
+      "computedHash": "9d1e82c5c409d2b0247245a005bc0f7e4447c0999b78dcea60f568c1ba4a6694"
+    },
+    "identity": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/identity/SKILL.md",
+      "computedHash": "cd601d3519eaf507eaa09f40aa6fda417ecf5ec34d95566adc05bf0e59f455f3"
+    },
+    "ios-design": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/ios-design/SKILL.md",
+      "computedHash": "5144e31607474a76c2584f75b80ee0e4c3803717bc873cef62823f719cefa686"
+    },
+    "ios-simulator-review": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/ios-simulator-review/SKILL.md",
+      "computedHash": "1a5fb5e55b969f303ef684f715262ad31474240e7b1782eacceb0069447112f5"
+    },
+    "notebooklm": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-automation/skills/notebooklm/SKILL.md",
+      "computedHash": "1426e4cbffbfb4607b04e7cd742f951f74bb8e9aff1ddc0b95d31c7bfbb23201"
+    },
+    "team": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/team/SKILL.md",
+      "computedHash": "65ec3363757715f75984ee8810ad3d8131d5f8daf832e0ff48f5d7c973a2eeb0"
+    },
+    "ux-design": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-design/skills/ux-design/SKILL.md",
+      "computedHash": "aa9284aa0ac6d3a3e08a88c0e71f40638bc051072e4efab9e4f8d8ce46cd31b3"
+    },
+    "visual": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/visual/SKILL.md",
+      "computedHash": "d6e0d1240b1e391ebf647d8da3f3d43fcecc7670dff208c35608c8fd772465bf"
+    },
+    "voice": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/voice/SKILL.md",
+      "computedHash": "a06804d13ec991d65792cf0b754b86f6a1a8f7809cc590bfd4d030c5f76fea67"
+    },
+    "ways-of-working": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-general/skills/ways-of-working/SKILL.md",
+      "computedHash": "4b74f4fadde319dff7f1d8848d48bf44b9e68bd55cd84f8961219ad3228e3606"
+    },
+    "webmcp": {
+      "source": "B-Reel-US/claude-fl-general",
+      "sourceType": "github",
+      "skillPath": "fl-automation/skills/webmcp/SKILL.md",
+      "computedHash": "cb7f34e83ab0baa630eb59209352c9fff8f2a4af65c86845f2846a74d6b6c62d"
+    }
+  }
+}

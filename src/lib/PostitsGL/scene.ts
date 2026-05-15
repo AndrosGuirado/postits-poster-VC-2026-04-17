@@ -406,6 +406,8 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		const rect = canvas.getBoundingClientRect();
 		if (rect.width === 0 || rect.height === 0) return;
 		renderer.setSize(rect.width, rect.height, false);
+		camera.aspect = rect.width / rect.height;
+		camera.updateProjectionMatrix();
 		requestRender();
 	}
 
@@ -518,7 +520,10 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	// ---------- Coverage + hover state ----------
 
-	const aabbs: THREE.Box3[] = groups.map(() => new THREE.Box3());
+	// Four corners of each postit in world XY, recomputed each coverage pass.
+	// Using OBB corners + SAT instead of THREE.Box3 AABB — rotated postits
+	// keep a much tighter footprint than their axis-aligned bounding box would.
+	const obbCorners: [number, number][][] = groups.map(() => []);
 	const covered: boolean[] = groups.map(() => false);
 	let hoveredIndex = -1;
 	let draggingIndex = -1;
@@ -548,24 +553,51 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		return j > i;
 	}
 
-	function overlap2D(a: THREE.Box3, b: THREE.Box3): boolean {
-		return (
-			a.min.x < b.max.x &&
-			a.max.x > b.min.x &&
-			a.min.y < b.max.y &&
-			a.max.y > b.min.y
-		);
+	// Compute the 4 world-space corners of postit i from known dimensions and
+	// group transform — no scene-graph traversal needed.
+	function computeOBB(i: number) {
+		const g = groups[i];
+		const cx = g.position.x;
+		const cy = g.position.y;
+		const cos = Math.cos(g.rotation.z);
+		const sin = Math.sin(g.rotation.z);
+		const hw = POSTIT_HALF_W;
+		const hh = POSTIT_HALF_H;
+		obbCorners[i] = [
+			[cx - hw * cos + hh * sin, cy - hw * sin - hh * cos],
+			[cx + hw * cos + hh * sin, cy + hw * sin - hh * cos],
+			[cx + hw * cos - hh * sin, cy + hw * sin + hh * cos],
+			[cx - hw * cos - hh * sin, cy - hw * sin + hh * cos],
+		];
+	}
+
+	// Separating Axis Theorem for two convex polygons in 2D.
+	// Returns true when they overlap (no separating axis found).
+	function obbOverlap(a: [number, number][], b: [number, number][]): boolean {
+		for (const poly of [a, b]) {
+			for (let i = 0; i < poly.length; i++) {
+				const j = (i + 1) % poly.length;
+				// Outward normal of edge i→j
+				const nx = -(poly[j][1] - poly[i][1]);
+				const ny = poly[j][0] - poly[i][0];
+				let minA = Infinity, maxA = -Infinity;
+				let minB = Infinity, maxB = -Infinity;
+				for (const [px, py] of a) { const p = px * nx + py * ny; if (p < minA) minA = p; if (p > maxA) maxA = p; }
+				for (const [px, py] of b) { const p = px * nx + py * ny; if (p < minB) minB = p; if (p > maxB) maxB = p; }
+				if (maxA < minB || maxB < minA) return false;
+			}
+		}
+		return true;
 	}
 
 	function recomputeCoverage() {
-		for (let i = 0; i < groups.length; i++)
-			aabbs[i].setFromObject(groups[i]);
+		for (let i = 0; i < groups.length; i++) computeOBB(i);
 		for (let i = 0; i < groups.length; i++) {
 			let c = false;
 			for (let j = 0; j < groups.length; j++) {
 				if (i === j) continue;
 				if (!isAbove(j, i)) continue;
-				if (overlap2D(aabbs[i], aabbs[j])) {
+				if (obbOverlap(obbCorners[i], obbCorners[j])) {
 					c = true;
 					break;
 				}
@@ -634,6 +666,8 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	const raycaster = new THREE.Raycaster();
 	const ndc = new THREE.Vector2();
+	const worldPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+	const worldTarget = new THREE.Vector3();
 
 	let dragging: THREE.Group | null = null;
 	const startWorld = new THREE.Vector2();
@@ -675,9 +709,13 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 
 	function getWorld(clientX: number, clientY: number, out: THREE.Vector2) {
 		const rect = canvas.getBoundingClientRect();
-		out.x = ((clientX - rect.left) / rect.width) * PAPER_W;
-		// Flip y: screen-down = world-down (smaller world y) under Y-up camera.
-		out.y = PAPER_H - ((clientY - rect.top) / rect.height) * PAPER_H;
+		ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+		ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+		raycaster.setFromCamera(ndc, camera);
+		if (raycaster.ray.intersectPlane(worldPlane, worldTarget)) {
+			out.x = worldTarget.x;
+			out.y = worldTarget.y;
+		}
 	}
 
 	function setNdc(clientX: number, clientY: number) {
@@ -858,8 +896,8 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			lastMoveTime = now;
 			const dx = wp.x - startWorld.x;
 			const dy = wp.y - startWorld.y;
-			const targetX = Math.max(0, Math.min(PAPER_W, startPos.x + dx));
-			const targetY = Math.max(0, Math.min(PAPER_H, startPos.y + dy));
+			const targetX = startPos.x + dx;
+			const targetY = startPos.y + dy;
 			if (xTo && yTo) {
 				xTo(targetX);
 				yTo(targetY);

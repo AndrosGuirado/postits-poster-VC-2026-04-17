@@ -22,28 +22,15 @@
 
 <template lang="pug">
 	main.canvas
-		.paper
-			PostitsGL(postits!="{postits}")
+		PostitsGL(postits!="{postits}")
 </template>
 
 <style lang="stylus">
 	@import '../lib/styles/main.styl'
 
 	.canvas
+		position fixed
+		inset 0
 		width 100%
-		min-height 100vh
-		display flex
-		justify-content center
-		align-items flex-start
-		padding var(--page-padding) var(--space-5)
-
-	.paper
-		position relative
-		height 90vh
-		height 90dvh
-		width auto
-		aspect-ratio 210 / 297
-		background-color var(--white)
-		box-shadow var(--shadow-paper)
-		overflow hidden
+		height 100%
 </style>
