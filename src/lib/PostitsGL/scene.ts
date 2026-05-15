@@ -8,6 +8,10 @@ export type PostitData = {
 	left: number; // % of paper width
 	top: number; // % of paper height
 	rotate: number; // deg
+	// When set, this element is added as a direct child of the WebGL canvas
+	// (which carries layoutsubtree) and is rendered as a live texture via
+	// gl.texElementImage2D in the canvas paint event. HTML-in-Canvas only.
+	htmlElement?: HTMLElement;
 };
 
 const SVG_W = 141;
@@ -100,6 +104,7 @@ type PostitMaterials = {
 	black: THREE.MeshBasicMaterial;
 	lift: LiftUniform;
 	hoverX: LiftUniform; // -1 (cursor at left edge) … +1 (cursor at right edge)
+	htmlTex?: THREE.Texture;
 };
 
 // GLSL injection that bends the postit's bottom up in z and shortens its y
@@ -216,7 +221,7 @@ function buildCurlInjection(
 	};
 }
 
-function makePostitMaterials(): PostitMaterials {
+function makePostitMaterials(htmlElement?: HTMLElement): PostitMaterials {
 	const lift: LiftUniform = { value: 0 };
 	const hoverX: LiftUniform = { value: 0 };
 	const injectCurl = buildCurlInjection(lift, hoverX, false);
@@ -269,10 +274,35 @@ function makePostitMaterials(): PostitMaterials {
 	});
 	black.onBeforeCompile = (shader) => injectCurlText(shader);
 
-	return { yellow, yellowDepth, black, lift, hoverX };
+	let htmlTex: THREE.Texture | undefined;
+	if (htmlElement) {
+		// Bare texture — no data, no needsUpdate. The actual GL texture is
+		// created manually after the renderer exists (see createScene) using
+		// texImage2D (mutable storage) so texElementImage2D can overwrite it.
+		htmlTex = new THREE.Texture();
+		htmlTex.wrapS = htmlTex.wrapT = THREE.ClampToEdgeWrapping;
+		htmlTex.minFilter = THREE.LinearFilter;
+		htmlTex.magFilter = THREE.LinearFilter;
+		htmlTex.generateMipmaps = false;
+		// True-color: don't tint the texture with the yellow material color.
+		yellow.color.set(0xffffff);
+		yellow.map = htmlTex;
+	}
+
+	return { yellow, yellowDepth, black, lift, hoverX, htmlTex };
 }
 
-export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
+type HtmlCanvasPanes = {
+	sun: HTMLElement;
+	shadow: HTMLElement;
+	drag: HTMLElement;
+};
+
+export function createScene(
+	canvas: HTMLCanvasElement,
+	postits: PostitData[],
+	options?: { htmlCanvasPanes?: HtmlCanvasPanes },
+) {
 	const scene = new THREE.Scene();
 	scene.background = new THREE.Color(WHITE);
 
@@ -296,6 +326,13 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	const groups: THREE.Group[] = [];
 	const mats: PostitMaterials[] = [];
 	const yellowMeshes: THREE.Mesh[] = [];
+	// Maps each pane HTMLElement → its material, for the paint event handler.
+	const htmlPaneMap = new Map<HTMLElement, PostitMaterials>();
+
+	// Opt the main canvas into HTML-in-Canvas if any PostIt carries an element.
+	if (postits.some((p) => p.htmlElement)) {
+		canvas.setAttribute('layoutsubtree', '');
+	}
 
 	// Tweakpane-tunable params. Held on an object so addBinding can mutate
 	// them; consumed in onPointerDown / onPointerUp at gesture time, so live
@@ -305,7 +342,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	};
 
 	postits.forEach((p, idx) => {
-		const m = makePostitMaterials();
+		const m = makePostitMaterials(p.htmlElement);
 		const g = new THREE.Group();
 
 		const yellowMesh = new THREE.Mesh(sharedGeos.yellowBg, m.yellow);
@@ -315,9 +352,16 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		g.add(yellowMesh);
 		yellowMeshes.push(yellowMesh);
 
-		sharedGeos.blackPaths.forEach((geom) =>
-			g.add(new THREE.Mesh(geom, m.black)),
-		);
+		if (p.htmlElement) {
+			// Append the pane div directly to the WebGL canvas so the browser
+			// lays it out, paints it, and fires paint events on this canvas.
+			canvas.appendChild(p.htmlElement);
+			htmlPaneMap.set(p.htmlElement, m);
+		} else {
+			sharedGeos.blackPaths.forEach((geom) =>
+				g.add(new THREE.Mesh(geom, m.black)),
+			);
+		}
 
 		// Each postit gets its own depth layer. Y is flipped because PostitData
 		// uses CSS-style "top % from top of paper" but the camera is Y-up.
@@ -396,6 +440,75 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	renderer.shadowMap.enabled = true;
 	renderer.shadowMap.type = THREE.PCFShadowMap;
 
+	// HTML-in-Canvas texture setup.
+	// Three.js allocates textures with texStorage2D (immutable storage), which
+	// makes texElementImage2D fail with GL_INVALID_OPERATION. We bypass that
+	// by creating our own mutable GL textures (texImage2D) and injecting them
+	// into Three.js's internal properties map before the first render.
+	const gl = renderer.getContext() as WebGL2RenderingContext;
+	// Physical pixel dimensions = CSS size × DPR, because texElementImage2D
+	// reads the element at its physical (device) pixel resolution.
+	const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+	const glTexMap = new Map<HTMLElement, WebGLTexture>();
+
+	htmlPaneMap.forEach((mat, el) => {
+		if (!mat.htmlTex) return;
+		const cssW = parseInt(el.style.width) || 564;
+		const cssH = parseInt(el.style.height) || 240;
+		const physW = Math.round(cssW * dpr);
+		const physH = Math.round(cssH * dpr);
+
+		const glTex = gl.createTexture()!;
+		gl.bindTexture(gl.TEXTURE_2D, glTex);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+		// texImage2D = mutable storage. texElementImage2D can overwrite it later.
+		// White initial pixels so the PostIt is white before paint fires.
+		const white = new Uint8Array(physW * physH * 4).fill(255);
+		gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, physW, physH, 0, gl.RGBA, gl.UNSIGNED_BYTE, white);
+		gl.bindTexture(gl.TEXTURE_2D, null);
+
+		// Register with Three.js's internal properties so it never allocates
+		// its own immutable texture for this THREE.Texture object.
+		const texProps = (renderer as any).properties.get(mat.htmlTex);
+		texProps.__glInit = true;
+		texProps.__webglTexture = glTex;
+		texProps.__version = mat.htmlTex.version; // prevents re-upload check
+
+		glTexMap.set(el, glTex);
+	});
+
+	// Resync after manual GL calls above.
+	if (htmlPaneMap.size > 0) renderer.resetState();
+
+	// paint fires on the main canvas (which has layoutsubtree) after the
+	// browser has painted its HTML children. texElementImage2D is only valid
+	// inside this callback.
+	const onCanvasPaint = (e: Event) => {
+		if (glTexMap.size === 0) return;
+		const changed: Element[] =
+			(e as any).changedElements ?? [...glTexMap.keys()];
+
+		for (const el of changed) {
+			const glTex = glTexMap.get(el as HTMLElement);
+			if (!glTex) continue;
+			gl.bindTexture(gl.TEXTURE_2D, glTex);
+			(gl as any).texElementImage2D(
+				gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el,
+			);
+			gl.bindTexture(gl.TEXTURE_2D, null);
+		}
+		renderer.resetState();
+		requestRender();
+	};
+
+	if (htmlPaneMap.size > 0) {
+		canvas.addEventListener('paint', onCanvasPaint);
+	}
+
 	let needsRender = true;
 	let raf = 0;
 	const requestRender = () => {
@@ -428,9 +541,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	gsap.ticker.add(requestRender);
 
 	// ---------- Debug controls (tweakpane) ----------
-	let pane: Pane | null = null;
-	//if (debug) {
-	pane = new Pane({ title: 'Light' });
+	const wallMat = wall.material as THREE.ShadowMaterial;
 
 	const onLightChange = () => {
 		sun.target.updateMatrixWorld();
@@ -440,62 +551,55 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 		requestRender();
 	};
 
-	const sunFolder = pane.addFolder({ title: 'Sun' });
-	sunFolder
-		.addBinding(sun.position, 'x', { min: -2, max: 2, step: 0.001 })
-		.on('change', onLightChange);
-	sunFolder
-		.addBinding(sun.position, 'y', { min: -2, max: 2, step: 0.001 })
-		.on('change', onLightChange);
-	sunFolder
-		.addBinding(sun.position, 'z', { min: 0.01, max: 3, step: 0.001 })
-		.on('change', onLightChange);
-	sunFolder
-		.addBinding(sun, 'intensity', { min: 0, max: 4, step: 0.05 })
-		.on('change', requestRender);
+	let pane: Pane | null = null;
+	const extraPanes: Pane[] = [];
 
-	const shadowFolder = pane.addFolder({ title: 'Shadow' });
-	shadowFolder.addBinding(sun, 'castShadow').on('change', requestRender);
-	shadowFolder
-		.addBinding(sun.shadow, 'radius', { min: 0, max: 20, step: 0.5 })
-		.on('change', requestRender);
-	shadowFolder
-		.addBinding(sun.shadow, 'bias', {
-			min: -0.01,
-			max: 0.01,
-			step: 0.0001,
-		})
-		.on('change', requestRender);
-	shadowFolder
-		.addBinding(sun.shadow, 'normalBias', {
-			min: 0,
-			max: 0.1,
-			step: 0.001,
-		})
-		.on('change', requestRender);
-	const wallMat = wall.material as THREE.ShadowMaterial;
-	shadowFolder
-		.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 })
-		.on('change', requestRender);
-	shadowFolder
-		.addBinding(ambient, 'intensity', { min: 0, max: 4, step: 0.05 })
-		.on('change', requestRender);
-	shadowFolder
-		.addBinding(wall.position, 'z', {
-			min: -0.3,
-			max: -0.001,
-			step: 0.001,
-		})
-		.on('change', requestRender);
+	if (options?.htmlCanvasPanes) {
+		// HTML-in-Canvas mode: mount each group into its PostIt's pane element.
+		// The offscreen 2D canvas's paint event re-draws the element as a texture.
+		const { sun: sunEl, shadow: shadowEl, drag: dragEl } = options.htmlCanvasPanes;
 
-	const dragFolder = pane.addFolder({ title: 'Drag' });
-	dragFolder.addBinding(dragParams, 'liftZ', {
-		label: 'lift z',
-		min: 0.0,
-		max: 0.5,
-		step: 0.001,
-	});
-	//}
+		const sunPane = new Pane({ container: sunEl });
+		sunPane.addBinding(sun.position, 'x', { min: -2, max: 2, step: 0.001 }).on('change', onLightChange);
+		sunPane.addBinding(sun.position, 'y', { min: -2, max: 2, step: 0.001 }).on('change', onLightChange);
+		sunPane.addBinding(sun.position, 'z', { min: 0.01, max: 3, step: 0.001 }).on('change', onLightChange);
+		sunPane.addBinding(sun, 'intensity', { min: 0, max: 4, step: 0.05 }).on('change', requestRender);
+
+		const shadowPane = new Pane({ container: shadowEl });
+		shadowPane.addBinding(sun, 'castShadow').on('change', requestRender);
+		shadowPane.addBinding(sun.shadow, 'radius', { min: 0, max: 20, step: 0.5 }).on('change', requestRender);
+		shadowPane.addBinding(sun.shadow, 'bias', { min: -0.01, max: 0.01, step: 0.0001 }).on('change', requestRender);
+		shadowPane.addBinding(sun.shadow, 'normalBias', { min: 0, max: 0.1, step: 0.001 }).on('change', requestRender);
+		shadowPane.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 }).on('change', requestRender);
+		shadowPane.addBinding(ambient, 'intensity', { min: 0, max: 4, step: 0.05 }).on('change', requestRender);
+		shadowPane.addBinding(wall.position, 'z', { min: -0.3, max: -0.001, step: 0.001 }).on('change', requestRender);
+
+		const dragPane = new Pane({ container: dragEl });
+		dragPane.addBinding(dragParams, 'liftZ', { label: 'lift z', min: 0.0, max: 0.5, step: 0.001 });
+
+		extraPanes.push(sunPane, shadowPane, dragPane);
+	} else {
+		// Floating pane (default, non-html-canvas mode).
+		pane = new Pane({ title: 'Light' });
+
+		const sunFolder = pane.addFolder({ title: 'Sun' });
+		sunFolder.addBinding(sun.position, 'x', { min: -2, max: 2, step: 0.001 }).on('change', onLightChange);
+		sunFolder.addBinding(sun.position, 'y', { min: -2, max: 2, step: 0.001 }).on('change', onLightChange);
+		sunFolder.addBinding(sun.position, 'z', { min: 0.01, max: 3, step: 0.001 }).on('change', onLightChange);
+		sunFolder.addBinding(sun, 'intensity', { min: 0, max: 4, step: 0.05 }).on('change', requestRender);
+
+		const shadowFolder = pane.addFolder({ title: 'Shadow' });
+		shadowFolder.addBinding(sun, 'castShadow').on('change', requestRender);
+		shadowFolder.addBinding(sun.shadow, 'radius', { min: 0, max: 20, step: 0.5 }).on('change', requestRender);
+		shadowFolder.addBinding(sun.shadow, 'bias', { min: -0.01, max: 0.01, step: 0.0001 }).on('change', requestRender);
+		shadowFolder.addBinding(sun.shadow, 'normalBias', { min: 0, max: 0.1, step: 0.001 }).on('change', requestRender);
+		shadowFolder.addBinding(wallMat, 'opacity', { min: 0, max: 1, step: 0.01 }).on('change', requestRender);
+		shadowFolder.addBinding(ambient, 'intensity', { min: 0, max: 4, step: 0.05 }).on('change', requestRender);
+		shadowFolder.addBinding(wall.position, 'z', { min: -0.3, max: -0.001, step: 0.001 }).on('change', requestRender);
+
+		const dragFolder = pane.addFolder({ title: 'Drag' });
+		dragFolder.addBinding(dragParams, 'liftZ', { label: 'lift z', min: 0.0, max: 0.5, step: 0.001 });
+	}
 
 	// ---------- Drag swing (velocity-driven tilt) ----------
 	// Each frame: decay the horizontal velocity, compute a bounded tilt
@@ -1066,6 +1170,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 	window.addEventListener('pointerup', onPointerUp);
 
 	return {
+		requestRender,
 		destroy() {
 			cancelAnimationFrame(raf);
 			gsap.ticker.remove(requestRender);
@@ -1075,12 +1180,17 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 			canvas.removeEventListener('pointerleave', onPointerLeave);
 			window.removeEventListener('pointermove', onPointerMove);
 			window.removeEventListener('pointerup', onPointerUp);
+			canvas.removeEventListener('paint', onCanvasPaint);
+			canvas.removeAttribute('layoutsubtree');
+			htmlPaneMap.forEach((_, el) => el.remove());
+			glTexMap.forEach((glTex) => gl.deleteTexture(glTex));
 			sharedGeos.yellowBg.dispose();
 			sharedGeos.blackPaths.forEach((g) => g.dispose());
 			mats.forEach((m) => {
 				m.yellow.dispose();
 				m.yellowDepth.dispose();
 				m.black.dispose();
+				m.htmlTex?.dispose();
 			});
 			wall.geometry.dispose();
 			(wall.material as THREE.Material).dispose();
@@ -1094,6 +1204,7 @@ export function createScene(canvas: HTMLCanvasElement, postits: PostitData[]) {
 				camHelper.dispose();
 			}
 			pane?.dispose();
+			extraPanes.forEach((p) => p.dispose());
 			renderer.dispose();
 		},
 	};
